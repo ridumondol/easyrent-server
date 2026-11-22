@@ -1,3 +1,5 @@
+const cors = require("cors");
+
 import 'dotenv/config';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
@@ -19,6 +21,11 @@ import { startBookingCompletionJob, stopBookingCompletionJob } from './jobs/book
 import { sendError, sendSuccess } from './utils/response.js';
 
 const app = express();
+
+app.use(cors({
+  origin: ["https://easyrent-client.vercel.app", "http://localhost:3000"],
+  credentials: true,
+}));
 app.disable('x-powered-by');
 const port = Number.parseInt(process.env.PORT ?? '5000', 10);
 const allowedOrigins = (process.env.CLIENT_URL ?? process.env.CORS_ORIGIN ?? '')
