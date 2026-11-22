@@ -1,5 +1,3 @@
-const cors = require("cors");
-
 import 'dotenv/config';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
@@ -22,27 +20,18 @@ import { sendError, sendSuccess } from './utils/response.js';
 
 const app = express();
 
-app.use(cors({
-  origin: ["https://easyrent-client.vercel.app", "http://localhost:3000"],
-  credentials: true,
-}));
-app.disable('x-powered-by');
 const port = Number.parseInt(process.env.PORT ?? '5000', 10);
-const allowedOrigins = (process.env.CLIENT_URL ?? process.env.CORS_ORIGIN ?? '')
-  .split(',')
-  .map((origin) => origin.trim())
-  .filter(Boolean);
 
-app.use((_request, response, next) => {
-  response.setHeader('X-Content-Type-Options', 'nosniff');
-  response.setHeader('X-Frame-Options', 'SAMEORIGIN');
-  response.setHeader('X-XSS-Protection', '1; mode=block');
-  response.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-  if (process.env.NODE_ENV === 'production') {
-    response.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
-  }
-  next();
-});
+const allowedOrigins = [
+  'https://easyrent-client.vercel.app',
+  'http://localhost:3000',
+  ...(process.env.CLIENT_URL ?? process.env.CORS_ORIGIN ?? '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean),
+];
+
+app.disable('x-powered-by');
 
 app.use(cors({
   origin(origin, callback) {
@@ -57,6 +46,17 @@ app.use(cors({
   methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept'],
 }));
+
+app.use((_request, response, next) => {
+  response.setHeader('X-Content-Type-Options', 'nosniff');
+  response.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  response.setHeader('X-XSS-Protection', '1; mode=block');
+  response.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  if (process.env.NODE_ENV === 'production') {
+    response.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+  next();
+});
 
 app.post('/api/payments/webhook', express.raw({ type: 'application/json' }), handleStripeWebhook);
 app.use(express.json({ limit: '10mb' }));
