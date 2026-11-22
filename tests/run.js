@@ -11,6 +11,7 @@ const baseUrl = `http://127.0.0.1:${port}`;
 
 const testFiles = [
   path.join(root, 'tests', 'utils.test.js'),
+  path.join(root, 'tests', 'cors.test.js'),
   path.join(root, 'tests', 'passwordSecurity.test.js'),
   path.join(root, 'tests', 'auth.test.js'),
   path.join(root, 'tests', 'booking.test.js'),

@@ -4,7 +4,13 @@ import { sendError, sendSuccess } from '../utils/response.js';
 import { calculateRentalAmount, calculateTotalAmount } from '../utils/rental.js';
 import { PENDING_HOLD_MINUTES } from '../utils/constants.js';
 import { isPositiveInteger, isPositiveNumber, isValidObjectId, toObjectId } from '../utils/validation.js';
-import { getStripeClient, getStripeCurrency } from '../services/stripeService.js';
+import {
+  constructStripeWebhookEvent,
+  getStripeClient,
+  getStripeCurrency,
+  isStripeSecretKeyConfigured,
+  isStripeWebhookSecretConfigured,
+} from '../services/stripeService.js';
 
 const PAYMENT_METHODS = ['demo_card', 'bkash_demo', 'nagad_demo'];
 const PAYMENT_OUTCOMES = ['success', 'failed', 'cancelled'];
@@ -182,6 +188,9 @@ export async function createStripeCheckout(request, response) {
   if (!process.env.CLIENT_URL) {
     return sendError(response, { statusCode: 503, message: 'CLIENT_URL is not configured for checkout redirects.' });
   }
+  if (!isStripeSecretKeyConfigured()) {
+    return sendError(response, { statusCode: 503, message: 'Stripe payments are not configured.' });
+  }
 
   try {
     const stripe = getStripeClient();
@@ -209,7 +218,7 @@ export async function createStripeCheckout(request, response) {
       return sendError(response, { statusCode: 400, message: 'Booking pricing is invalid and cannot be paid.' });
     }
 
-    const existingPayment = await payments.findOne({
+    let existingPayment = await payments.findOne({
       bookingId: bookingObjectId,
       renterId: request.user.userId,
       status: 'pending',
@@ -217,15 +226,35 @@ export async function createStripeCheckout(request, response) {
     if (existingPayment?.stripeCheckoutSessionId) {
       const existingSession = await stripe.checkout.sessions.retrieve(existingPayment.stripeCheckoutSessionId);
       if (existingSession.status === 'open' && existingSession.url) {
+        if (!existingPayment.checkoutReservation) {
+          await payments.updateOne(
+            { _id: existingPayment._id, status: 'pending' },
+            { $set: { checkoutReservation: true, updatedAt: now } },
+          );
+        }
         return sendSuccess(response, {
           message: 'Stripe Checkout session retrieved.',
           data: { checkoutUrl: existingSession.url, sessionId: existingSession.id },
         });
       }
-      await payments.updateOne(
-        { _id: existingPayment._id, status: 'pending' },
-        { $set: { status: 'failed', updatedAt: now } },
-      );
+      if (existingSession.status === 'complete') {
+        return sendError(response, {
+          statusCode: 409,
+          message: 'This payment is processing. Check your payment history before trying again.',
+        });
+      }
+      if (existingSession.status === 'expired') {
+        await payments.updateOne(
+          { _id: existingPayment._id, status: 'pending' },
+          { $set: { status: 'failed', updatedAt: now } },
+        );
+        existingPayment = null;
+      } else {
+        return sendError(response, {
+          statusCode: 409,
+          message: 'An existing payment session could not be verified. Please try again later.',
+        });
+      }
     }
 
     const equipment = await getDB().collection('equipment').findOne(
@@ -242,13 +271,65 @@ export async function createStripeCheckout(request, response) {
       return sendError(response, { statusCode: 400, message: 'Booking amount is outside supported payment limits.' });
     }
 
+    let reservation = existingPayment;
+    if (reservation) {
+      try {
+        await payments.updateOne(
+          { _id: reservation._id, status: 'pending' },
+          { $set: { checkoutReservation: true, updatedAt: now } },
+        );
+      } catch (error) {
+        if (error?.code !== 11000) throw error;
+        reservation = await payments.findOne({
+          bookingId: bookingObjectId,
+          renterId: request.user.userId,
+          status: 'pending',
+          checkoutReservation: true,
+        });
+      }
+    } else {
+      const newReservation = {
+        transactionId: randomUUID(),
+        bookingId: bookingObjectId,
+        renterId: request.user.userId,
+        amount,
+        currency,
+        productName: equipment.title,
+        checkoutReservation: true,
+        status: 'pending',
+        createdAt: now,
+        updatedAt: now,
+      };
+      try {
+        const result = await payments.insertOne(newReservation);
+        reservation = { ...newReservation, _id: result.insertedId };
+      } catch (error) {
+        if (error?.code !== 11000) throw error;
+        reservation = await payments.findOne({
+          bookingId: bookingObjectId,
+          renterId: request.user.userId,
+          status: 'pending',
+          checkoutReservation: true,
+        });
+      }
+    }
+
+    if (!reservation) {
+      return sendError(response, {
+        statusCode: 409,
+        message: 'A checkout session is already being created for this booking.',
+      });
+    }
+
+    const successUrl = new URL('/payment/success?session_id={CHECKOUT_SESSION_ID}', process.env.CLIENT_URL).toString();
+    const cancelUrl = new URL('/customer/bookings?payment=cancelled', process.env.CLIENT_URL).toString();
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
       line_items: [{
         price_data: {
-          currency,
-          unit_amount: amountInMinorUnits,
-          product_data: { name: equipment.title },
+          currency: reservation.currency,
+          unit_amount: Math.round(reservation.amount * 100),
+          product_data: { name: reservation.productName || equipment.title },
         },
         quantity: 1,
       }],
@@ -256,24 +337,23 @@ export async function createStripeCheckout(request, response) {
         bookingId: bookingObjectId.toString(),
         renterId: request.user.userId.toString(),
       },
-      success_url: new URL('/payment/success?session_id={CHECKOUT_SESSION_ID}', process.env.CLIENT_URL).toString(),
-      cancel_url: new URL('/customer/bookings?payment=cancelled', process.env.CLIENT_URL).toString(),
-    });
+      success_url: successUrl,
+      cancel_url: cancelUrl,
+    }, { idempotencyKey: reservation.transactionId });
     if (!session.url) throw new Error('Stripe did not return a Checkout URL.');
 
-    const transaction = {
-      transactionId: randomUUID(),
-      bookingId: bookingObjectId,
-      renterId: request.user.userId,
-      stripeCheckoutSessionId: session.id,
-      amount,
-      currency,
-      status: 'pending',
-      sessionExpiresAt: session.expires_at ? new Date(session.expires_at * 1000) : undefined,
-      createdAt: now,
-      updatedAt: now,
-    };
-    await payments.insertOne(transaction);
+    await payments.updateOne(
+      { _id: reservation._id, status: 'pending' },
+      {
+        $set: {
+          stripeCheckoutSessionId: session.id,
+          updatedAt: new Date(),
+          ...(session.expires_at
+            ? { sessionExpiresAt: new Date(session.expires_at * 1000) }
+            : {}),
+        },
+      },
+    );
 
     return sendSuccess(response, {
       statusCode: 201,
@@ -281,9 +361,6 @@ export async function createStripeCheckout(request, response) {
       data: { checkoutUrl: session.url, sessionId: session.id },
     });
   } catch (error) {
-    if (!process.env.STRIPE_SECRET_KEY) {
-      return sendError(response, { statusCode: 503, message: 'Stripe payments are not configured.' });
-    }
     console.error('Stripe checkout creation failed:', error);
     return sendError(response, { statusCode: 502, message: 'Unable to create a Stripe Checkout session.' });
   }
@@ -291,23 +368,36 @@ export async function createStripeCheckout(request, response) {
 
 export async function handleStripeWebhook(request, response) {
   const signature = request.headers['stripe-signature'];
-  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
-  if (!webhookSecret || typeof signature !== 'string') {
-    return sendError(response, { statusCode: 400, message: 'Stripe webhook signature is missing or not configured.' });
+  if (typeof signature !== 'string') {
+    return sendError(response, { statusCode: 400, message: 'Stripe webhook signature is missing.' });
+  }
+  if (!isStripeWebhookSecretConfigured()) {
+    return sendError(response, { statusCode: 503, message: 'Stripe webhook signing is not configured.' });
   }
 
   let event;
   try {
-    event = getStripeClient().webhooks.constructEvent(request.body, signature, webhookSecret);
+    event = constructStripeWebhookEvent(request.body, signature, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (error) {
     console.warn('Stripe webhook signature verification failed:', error.message);
     return sendError(response, { statusCode: 400, message: 'Invalid Stripe webhook signature.' });
   }
 
+  if (event.livemode === true) {
+    console.warn('Rejected a live-mode Stripe webhook event while test mode is enforced.');
+    return sendError(response, { statusCode: 400, message: 'Live-mode Stripe events are not accepted.' });
+  }
+
   try {
-    if (event.type === 'checkout.session.completed') {
+    if (event.type === 'checkout.session.completed' || event.type === 'checkout.session.async_payment_succeeded') {
       const session = event.data.object;
-      if (session.payment_status !== 'paid' || !session.metadata?.bookingId) {
+      if (session.payment_status !== 'paid') {
+        return sendSuccess(response, {
+          message: 'Stripe payment is still processing.',
+          data: { received: true },
+        });
+      }
+      if (!session.metadata?.bookingId) {
         return sendError(response, { statusCode: 400, message: 'Completed Checkout session has invalid payment metadata.' });
       }
 
@@ -365,7 +455,10 @@ export async function handleStripeWebhook(request, response) {
           },
         },
       );
-    } else if (event.type === 'checkout.session.expired') {
+    } else if (
+      event.type === 'checkout.session.expired'
+      || event.type === 'checkout.session.async_payment_failed'
+    ) {
       const session = event.data.object;
       await getDB().collection('payments').updateOne(
         { stripeCheckoutSessionId: session.id, status: 'pending' },

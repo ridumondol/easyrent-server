@@ -11,6 +11,14 @@ const indexedModels = [User, Equipment, Booking, Payment, Favorite, Review, Cont
 
 export async function ensureIndexes() {
   await Promise.all(indexedModels.map((model) => model.createIndexes()));
+  await Payment.collection.createIndex(
+    { bookingId: 1 },
+    {
+      name: 'one_pending_checkout_per_booking',
+      unique: true,
+      partialFilterExpression: { status: 'pending', checkoutReservation: true },
+    },
+  );
 }
 
 export async function connectToDatabase() {

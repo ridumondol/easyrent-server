@@ -6,6 +6,8 @@ const paymentSchema = new mongoose.Schema({
   transactionId: { type: String, required: true, unique: true },
   stripeCheckoutSessionId: { type: String, unique: true, sparse: true },
   stripePaymentIntentId: { type: String, default: '' },
+  checkoutReservation: { type: Boolean, default: false },
+  productName: { type: String },
   sessionExpiresAt: { type: Date },
   amount: { type: Number, required: true, min: 0 },
   currency: { type: String, default: 'bdt', lowercase: true },

@@ -3,6 +3,7 @@ import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import express from 'express';
 import { closeDatabase, connectToDatabase, getDatabaseStatus } from './config/db.js';
+import { getAllowedOrigins } from './config/cors.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import healthRoutes from './routes/healthRoutes.js';
 import authRoutes from './routes/authRoutes.js';
@@ -22,20 +23,13 @@ const app = express();
 
 const port = Number.parseInt(process.env.PORT ?? '5000', 10);
 
-const allowedOrigins = [
-  'https://easyrent-client.vercel.app',
-  'http://localhost:3000',
-  ...(process.env.CLIENT_URL ?? process.env.CORS_ORIGIN ?? '')
-    .split(',')
-    .map((origin) => origin.trim())
-    .filter(Boolean),
-];
+const allowedOrigins = getAllowedOrigins(process.env.CLIENT_URL, process.env.CORS_ORIGIN);
 
 app.disable('x-powered-by');
 
 app.use(cors({
   origin(origin, callback) {
-    if (!origin || allowedOrigins.includes(origin)) {
+    if (!origin || allowedOrigins.has(origin)) {
       callback(null, true);
       return;
     }
@@ -96,8 +90,14 @@ let isShuttingDown = false;
 function validateEnvironment() {
   const missing = [];
   if (!process.env.MONGODB_URI) missing.push('MONGODB_URI');
-  if (process.env.NODE_ENV === 'production' && !process.env.JWT_SECRET) {
-    missing.push('JWT_SECRET');
+  if (process.env.NODE_ENV === 'production') {
+    const jwtSecret = process.env.JWT_SECRET ?? '';
+    if (
+      jwtSecret.length < 32
+      || /^(your_|replace_with|change_me|placeholder)/i.test(jwtSecret)
+    ) {
+      missing.push('JWT_SECRET (must be a non-placeholder value of at least 32 characters)');
+    }
   }
   if (missing.length > 0) {
     console.error(`Fatal: Missing required environment variables: ${missing.join(', ')}`);
@@ -115,7 +115,7 @@ async function startServer() {
   try {
     await connectToDatabase();
   } catch (error) {
-    console.error('Unable to start EasyRent API: MongoDB connection failed.', error);
+    console.error('Unable to start Rentora API: MongoDB connection failed.', error);
     process.exitCode = 1;
     return;
   }

@@ -10,6 +10,7 @@ import {
 } from '../utils/rental.js';
 import { isValidObjectId } from '../utils/validation.js';
 import { buildBlockingBookingsFilter } from '../utils/availability.js';
+import { getHealth } from '../controllers/healthController.js';
 
 describe('Rental utility functions', () => {
   it('parses date-only strings into UTC midnight', () => {
@@ -95,5 +96,28 @@ describe('Validation & availability helpers', () => {
       excludeBookingId,
     });
     assert.deepEqual(filter._id, { $ne: excludeBookingId });
+  });
+});
+
+describe('Health endpoint', () => {
+  it('returns 503 when the database is disconnected', () => {
+    const response = {
+      statusCode: null,
+      body: null,
+      status(statusCode) {
+        this.statusCode = statusCode;
+        return this;
+      },
+      json(body) {
+        this.body = body;
+        return this;
+      },
+    };
+
+    getHealth({}, response);
+
+    assert.equal(response.statusCode, 503);
+    assert.equal(response.body.success, false);
+    assert.notEqual(response.body.data.database, 'connected');
   });
 });

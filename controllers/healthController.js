@@ -1,13 +1,24 @@
 import { getDatabaseStatus } from '../config/db.js';
-import { sendSuccess } from '../utils/response.js';
+import { sendError, sendSuccess } from '../utils/response.js';
 
 export function getHealth(_request, response) {
+  const database = getDatabaseStatus();
+  const data = {
+    status: database === 'connected' ? 'running' : 'unavailable',
+    database,
+    timestamp: new Date().toISOString(),
+  };
+
+  if (database !== 'connected') {
+    return sendError(response, {
+      statusCode: 503,
+      message: 'Rentora API is not ready.',
+      data,
+    });
+  }
+
   sendSuccess(response, {
-    message: 'EasyRent API health status',
-    data: {
-      status: 'running',
-      database: getDatabaseStatus(),
-      timestamp: new Date().toISOString(),
-    },
+    message: 'Rentora API health status',
+    data,
   });
 }

@@ -70,15 +70,46 @@ requires the three `SEED_*_EMAIL` and `SEED_*_PASSWORD` pairs. It creates:
 The seed command never prints passwords or overwrites existing account passwords.
 Use strong local-only credentials and do not commit `.env`.
 
-For Stripe, configure test-mode `STRIPE_SECRET_KEY` and
-`STRIPE_WEBHOOK_SECRET`. Start the Stripe CLI in **Terminal: server** (the server
-folder can be anywhere on `PATH`) and forward events to the local webhook:
+For Stripe, configure a test-mode `STRIPE_SECRET_KEY` (`sk_test_...`) and the
+webhook signing secret (`whsec_...`). The API rejects live-mode keys. Start the
+Stripe CLI in **Terminal: server** (the server folder can be anywhere on `PATH`)
+and forward events to the local webhook:
 
 ```powershell
 stripe listen --forward-to localhost:5000/api/payments/webhook
 ```
 
 Copy the signing secret printed by Stripe CLI into `STRIPE_WEBHOOK_SECRET`.
+Enable `checkout.session.completed`, `checkout.session.expired`,
+`checkout.session.async_payment_succeeded`, and
+`checkout.session.async_payment_failed` for the deployed webhook endpoint. A
+booking has one active checkout reservation; retries reuse the same Stripe
+idempotency key until that session succeeds, expires, or fails.
+
+### Render and Vercel payment configuration
+
+For a test-mode deployment, set these backend variables in Render. Keep both
+Stripe secrets private and never add them to Vercel or a `NEXT_PUBLIC_*` value.
+
+| Render variable | Value |
+| --- | --- |
+| `STRIPE_SECRET_KEY` | Stripe test-mode secret key (`sk_test_...`) |
+| `STRIPE_WEBHOOK_SECRET` | Signing secret (`whsec_...`) for the matching test-mode webhook endpoint |
+| `STRIPE_CURRENCY` | `bdt` (or another currency supported by the Stripe account) |
+| `CLIENT_URL` | The deployed Vercel frontend origin, without a path or trailing slash |
+| `CORS_ORIGIN` | Optional additional frontend origins, comma-separated |
+
+In Stripe's test-mode Developers > Webhooks settings, register
+`https://<your-render-host>/api/payments/webhook` and subscribe to the four
+Checkout events listed above. Use that endpoint's signing secret in Render.
+The Render manifest declares the Stripe secrets as unsynchronized environment
+variables so they must be set privately in the Render dashboard.
+
+In Vercel, set `NEXT_PUBLIC_API_URL` to
+`https://<your-render-host>/api`, then rebuild the frontend. The success and
+cancel redirects are derived from the backend `CLIENT_URL`. Keep Stripe in test
+mode on both Stripe and Render; do not use a live secret key or real card.
+
 Password reset email requires these backend environment variables:
 
 | Variable | Value |

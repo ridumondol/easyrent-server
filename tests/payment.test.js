@@ -1,6 +1,7 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { ObjectId } from 'mongodb';
+import Stripe from 'stripe';
 import {
   api,
   registerUser,
@@ -10,15 +11,19 @@ import {
   assertError,
   assertSuccess,
 } from './helpers.js';
+import { isStripeWebhookSecretConfigured } from '../services/stripeService.js';
 
 let renter;
 let otherRenter;
+let owner;
+const hasStripeWebhookConfiguration = isStripeWebhookSecretConfigured();
 
 describe('Demo Payments API', () => {
   before(async () => {
-    [renter, otherRenter] = await Promise.all([
+    [renter, otherRenter, owner] = await Promise.all([
       registerUser('renter', 'demoPaymentRenter'),
       registerUser('renter', 'demoPaymentOtherRenter'),
+      registerUser('owner', 'demoPaymentOwner'),
     ]);
   });
 
@@ -45,6 +50,221 @@ describe('Demo Payments API', () => {
       403,
       'only the renter',
     );
+    assert.equal(
+      (await api('/api/payments/checkout', {
+        method: 'POST',
+        token: owner.token,
+        body: { bookingId: booking._id.toString() },
+      })).status,
+      403,
+    );
+  });
+
+  it('rejects webhook requests without a Stripe signature', async () => {
+    const result = await api('/api/payments/webhook', {
+      method: 'POST',
+      body: { type: 'checkout.session.completed' },
+    });
+
+    assert.equal(result.status, 400);
+    assert.match(result.body.message, /signature/i);
+  });
+
+  it('allows only one pending Stripe checkout reservation per booking', async () => {
+    const { db } = await getTestDb();
+    const bookingId = new ObjectId();
+    const now = new Date();
+    const reservation = {
+      transactionId: `reservation_${bookingId}`,
+      bookingId,
+      renterId: new ObjectId(renter.user.id ?? renter.user._id),
+      amount: 100,
+      currency: 'bdt',
+      checkoutReservation: true,
+      status: 'pending',
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    await db.collection('payments').insertOne(reservation);
+    await assert.rejects(
+      db.collection('payments').insertOne({
+        ...reservation,
+        transactionId: `duplicate_${bookingId}`,
+      }),
+      (error) => error.code === 11000,
+    );
+  });
+
+  it('verifies Stripe signatures and processes payment and failure events', {
+    skip: !hasStripeWebhookConfiguration,
+  }, async () => {
+    const { db } = await getTestDb();
+    const payments = db.collection('payments');
+    const bookings = db.collection('bookings');
+    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+    const renterId = new ObjectId(renter.user.id ?? renter.user._id);
+    const paidBooking = await insertBookingDirect({
+      renterId,
+      bookingStatus: 'pending',
+      paymentStatus: 'unpaid',
+    });
+    const paidPayment = {
+      transactionId: `webhook_${paidBooking._id}`,
+      bookingId: paidBooking._id,
+      renterId,
+      stripeCheckoutSessionId: `cs_test_${paidBooking._id}`,
+      amount: 300,
+      currency: 'bdt',
+      checkoutReservation: true,
+      status: 'pending',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+    const paidPaymentResult = await payments.insertOne(paidPayment);
+
+    const completedEvent = {
+      id: `evt_test_${paidBooking._id}`,
+      object: 'event',
+      type: 'checkout.session.completed',
+      data: {
+        object: {
+          id: paidPayment.stripeCheckoutSessionId,
+          payment_status: 'paid',
+          metadata: {
+            bookingId: paidBooking._id.toString(),
+            renterId: renterId.toString(),
+          },
+          amount_total: 30000,
+          currency: 'bdt',
+          payment_intent: `pi_test_${paidBooking._id}`,
+        },
+      },
+    };
+    const completedPayload = JSON.stringify(completedEvent);
+    const completedSignature = Stripe.webhooks.generateTestHeaderString({
+      payload: completedPayload,
+      secret: webhookSecret,
+    });
+    const completed = await api('/api/payments/webhook', {
+      method: 'POST',
+      headers: { 'stripe-signature': completedSignature },
+      body: completedEvent,
+    });
+    assert.equal(completed.status, 200);
+    assert.equal(
+      (await bookings.findOne({ _id: paidBooking._id })).paymentStatus,
+      'paid',
+    );
+    assert.equal(
+      (await payments.findOne({ _id: paidPaymentResult.insertedId })).status,
+      'success',
+    );
+
+    const replay = await api('/api/payments/webhook', {
+      method: 'POST',
+      headers: { 'stripe-signature': completedSignature },
+      body: completedEvent,
+    });
+    assert.equal(replay.status, 200);
+    assert.equal(await payments.countDocuments({
+      bookingId: paidBooking._id,
+      status: 'success',
+    }), 1);
+
+    const failedBooking = await insertBookingDirect({
+      renterId,
+      bookingStatus: 'pending',
+      paymentStatus: 'unpaid',
+    });
+    const failedSessionId = `cs_test_${failedBooking._id}`;
+    await payments.insertOne({
+      transactionId: `async_failed_${failedBooking._id}`,
+      bookingId: failedBooking._id,
+      renterId,
+      stripeCheckoutSessionId: failedSessionId,
+      amount: 300,
+      currency: 'bdt',
+      checkoutReservation: true,
+      status: 'pending',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    const failedEvent = {
+      id: `evt_failed_${failedBooking._id}`,
+      object: 'event',
+      type: 'checkout.session.async_payment_failed',
+      data: { object: { id: failedSessionId } },
+    };
+    const failedPayload = JSON.stringify(failedEvent);
+    const failedSignature = Stripe.webhooks.generateTestHeaderString({
+      payload: failedPayload,
+      secret: webhookSecret,
+    });
+    const failed = await api('/api/payments/webhook', {
+      method: 'POST',
+      headers: { 'stripe-signature': failedSignature },
+      body: failedEvent,
+    });
+    assert.equal(failed.status, 200);
+    assert.equal(
+      (await payments.findOne({ stripeCheckoutSessionId: failedSessionId })).status,
+      'failed',
+    );
+    assert.equal(
+      (await bookings.findOne({ _id: failedBooking._id })).paymentStatus,
+      'unpaid',
+    );
+
+    const liveModeBooking = await insertBookingDirect({
+      renterId,
+      bookingStatus: 'pending',
+      paymentStatus: 'unpaid',
+    });
+    const liveModeSessionId = `cs_test_live_mode_${liveModeBooking._id}`;
+    await payments.insertOne({
+      transactionId: `live_mode_${liveModeBooking._id}`,
+      bookingId: liveModeBooking._id,
+      renterId,
+      stripeCheckoutSessionId: liveModeSessionId,
+      amount: 300,
+      currency: 'bdt',
+      checkoutReservation: true,
+      status: 'pending',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    const liveModeEvent = {
+      id: `evt_live_mode_${liveModeBooking._id}`,
+      object: 'event',
+      type: 'checkout.session.expired',
+      livemode: true,
+      data: { object: { id: liveModeSessionId } },
+    };
+    const liveModePayload = JSON.stringify(liveModeEvent);
+    const liveModeSignature = Stripe.webhooks.generateTestHeaderString({
+      payload: liveModePayload,
+      secret: webhookSecret,
+    });
+    const liveMode = await api('/api/payments/webhook', {
+      method: 'POST',
+      headers: { 'stripe-signature': liveModeSignature },
+      body: liveModeEvent,
+    });
+    assert.equal(liveMode.status, 400);
+    assert.match(liveMode.body.message, /live-mode/i);
+    assert.equal(
+      (await payments.findOne({ stripeCheckoutSessionId: liveModeSessionId })).status,
+      'pending',
+    );
+
+    const tampered = await api('/api/payments/webhook', {
+      method: 'POST',
+      headers: { 'stripe-signature': 't=1,v1=invalid' },
+      body: failedEvent,
+    });
+    assert.equal(tampered.status, 400);
+    assert.match(tampered.body.message, /signature/i);
   });
 
   it('validates payment method and simulated outcome', async () => {
