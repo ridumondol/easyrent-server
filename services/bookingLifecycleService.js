@@ -24,7 +24,7 @@ export async function refundPaymentRecord(
   if (payment.stripePaymentIntentId) {
     refund = await refundStripePayment(
       payment.stripePaymentIntentId,
-      `rentora-booking-refund-${payment.bookingId}`,
+      `rentora-payment-refund-${payment.transactionId}`,
     );
   } else if (!payment.paymentMethod) {
     throw new Error(`Payment ${payment.transactionId} has no refundable payment reference.`);
@@ -125,7 +125,7 @@ async function processPendingRefunds(now, refundStripePayment) {
         },
         { $set: { refundStatus: 'failed', updatedAt: now } },
       );
-      console.error(`Automatic refund failed for booking ${booking._id}:`, error.message);
+      console.error(`Automatic refund failed for booking ${booking._id}.`);
     }
   }
 

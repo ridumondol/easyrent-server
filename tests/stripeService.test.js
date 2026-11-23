@@ -12,6 +12,7 @@ describe('Stripe environment configuration validation', () => {
       '',
       'pk_test_1234567890abcdef',
       'rk_test_1234567890abcdef',
+      'rkcs_test_1234567890abcdef',
       'sk_live_1234567890abcdef',
       'sk_test_short',
       'sk_test_your_test_secret_key',

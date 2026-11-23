@@ -101,8 +101,10 @@ Stripe secrets private and never add them to Vercel or a `NEXT_PUBLIC_*` value.
 | `CORS_ORIGIN` | Optional additional frontend origins, comma-separated |
 
 In Stripe's test-mode Developers > Webhooks settings, register
-`https://easyrent-server-ifgf.onrender.com/api/payments/webhook` and subscribe to the four
-Checkout events listed above. Use that endpoint's signing secret in Render.
+`https://easyrent-server-ifgf.onrender.com/api/payments/webhook` and subscribe to
+`checkout.session.completed`, `checkout.session.expired`,
+`checkout.session.async_payment_succeeded`, `checkout.session.async_payment_failed`,
+`payment_intent.payment_failed`, and `charge.refunded`. Use that endpoint's signing secret in Render.
 The Render manifest declares the Stripe secrets as unsynchronized environment
 variables so they must be set privately in the Render dashboard.
 

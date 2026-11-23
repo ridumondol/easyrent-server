@@ -309,7 +309,7 @@ async function createDemoCheckout(request, response) {
   }
 }
 
-export async function createStripeCheckout(request, response) {
+export async function createStripeCheckout(request, response, stripeClientOverride) {
   const { bookingId } = request.body ?? {};
   if (!isValidObjectId(bookingId)) {
     return sendError(response, { statusCode: 400, message: 'A valid bookingId is required.' });
@@ -318,11 +318,14 @@ export async function createStripeCheckout(request, response) {
     return sendError(response, { statusCode: 503, message: 'CLIENT_URL is not configured for checkout redirects.' });
   }
   if (!isStripeSecretKeyConfigured()) {
-    return sendError(response, { statusCode: 503, message: 'Stripe payments are not configured.' });
+    return sendError(response, {
+      statusCode: 503,
+      message: 'Stripe payments are unavailable. Configure a valid Stripe test secret key (sk_test_...) in the server environment.',
+    });
   }
 
   try {
-    const stripe = getStripeClient();
+    const stripe = stripeClientOverride ?? getStripeClient();
     const bookings = getBookingsCollection();
     const payments = getDB().collection('payments');
     const bookingObjectId = toObjectId(bookingId);
@@ -375,7 +378,7 @@ export async function createStripeCheckout(request, response) {
       if (existingSession.status === 'expired') {
         await payments.updateOne(
           { _id: existingPayment._id, status: 'pending' },
-          { $set: { status: 'failed', updatedAt: now } },
+          { $set: { status: 'cancelled', updatedAt: now } },
         );
         existingPayment = null;
       } else {
@@ -498,7 +501,7 @@ export async function createStripeCheckout(request, response) {
       data: { checkoutUrl: session.url, sessionId: session.id },
     });
   } catch (error) {
-    console.error('Stripe checkout creation failed:', error);
+    console.error('Stripe checkout creation failed.');
     return sendError(response, { statusCode: 502, message: 'Unable to create a Stripe Checkout session.' });
   }
 }
@@ -725,7 +728,7 @@ export async function handleStripeWebhook(
 
     return sendSuccess(response, { message: 'Stripe event received.', data: { received: true } });
   } catch (error) {
-    console.error('Stripe webhook processing failed:', error);
+    console.error('Stripe webhook processing failed.');
     return sendError(response, { statusCode: 500, message: 'Stripe webhook could not be processed.' });
   }
 }
