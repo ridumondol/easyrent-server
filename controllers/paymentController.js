@@ -3,13 +3,16 @@ import { getDB } from '../config/db.js';
 import { sendError, sendSuccess } from '../utils/response.js';
 import { calculateRentalAmount, calculateTotalAmount } from '../utils/rental.js';
 import { PENDING_HOLD_MINUTES } from '../utils/constants.js';
+import { getDateAvailability } from '../utils/availability.js';
 import { isPositiveInteger, isPositiveNumber, isValidObjectId, toObjectId } from '../utils/validation.js';
+import { refundPaymentRecord } from '../services/bookingLifecycleService.js';
 import {
   constructStripeWebhookEvent,
   getStripeClient,
   getStripeCurrency,
   isStripeSecretKeyConfigured,
   isStripeWebhookSecretConfigured,
+  refundStripePaymentIntent,
 } from '../services/stripeService.js';
 
 const PAYMENT_METHODS = ['demo_card', 'bkash_demo', 'nagad_demo'];
@@ -41,6 +44,128 @@ function calculateBookingAmount(booking) {
 
 function getPendingHoldCutoff(now) {
   return new Date(now.getTime() - PENDING_HOLD_MINUTES * 60 * 1000);
+}
+
+function getPaymentIntentId(paymentIntent) {
+  if (typeof paymentIntent === 'string') return paymentIntent;
+  return typeof paymentIntent?.id === 'string' ? paymentIntent.id : '';
+}
+
+async function refundCapturedStripePayment({
+  payment,
+  booking,
+  payments,
+  paymentIntentId,
+  reason,
+  now,
+  refundStripePayment,
+}) {
+  await payments.updateOne(
+    { _id: payment._id, status: { $in: ['pending', 'failed', 'cancelled', 'success'] } },
+    {
+      $set: {
+        status: 'success',
+        stripePaymentIntentId: paymentIntentId,
+        updatedAt: now,
+      },
+    },
+  );
+  const capturedPayment = {
+    ...payment,
+    status: 'success',
+    stripePaymentIntentId: paymentIntentId,
+  };
+  const bookings = getBookingsCollection();
+  const bookingAlreadyPaidForAnotherPayment =
+    booking?.paymentStatus === 'paid'
+    && booking.paymentTransactionId
+    && booking.paymentTransactionId !== payment.transactionId;
+
+  if (booking && !bookingAlreadyPaidForAnotherPayment) {
+    await bookings.updateOne(
+      { _id: booking._id, bookingStatus: { $ne: 'completed' } },
+      {
+        $set: {
+          bookingStatus: 'cancelled',
+          paymentStatus: 'paid',
+          paymentTransactionId: payment.transactionId,
+          paidAt: booking.paidAt ?? now,
+          cancellationReason: reason,
+          refundStatus: 'pending',
+          updatedAt: now,
+        },
+      },
+    );
+  }
+
+  await refundPaymentRecord(capturedPayment, payments, now, refundStripePayment);
+  if (booking) {
+    await bookings.updateOne(
+      {
+        _id: booking._id,
+        paymentStatus: 'paid',
+        paymentTransactionId: payment.transactionId,
+      },
+      {
+        $set: {
+          paymentStatus: 'refunded',
+          refundStatus: 'succeeded',
+          refundedAt: now,
+          cancellationReason: reason,
+          updatedAt: now,
+        },
+      },
+    );
+  }
+}
+
+async function claimStripePayment(bookings, initialBooking, payment, now) {
+  let booking = initialBooking;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (
+      booking.paymentStatus === 'paid'
+      && booking.paymentTransactionId === payment.transactionId
+    ) {
+      return booking;
+    }
+
+    const wasExpiredHold =
+      booking.bookingStatus === 'cancelled'
+      && booking.paymentStatus === 'unpaid'
+      && booking.cancellationReason === 'payment_hold_expired';
+    const canAcceptPayment =
+      (booking.bookingStatus === 'pending' && booking.paymentStatus === 'unpaid')
+      || wasExpiredHold
+      || (booking.bookingStatus === 'confirmed' && booking.paymentStatus === 'unpaid');
+    if (!canAcceptPayment) return null;
+
+    const update = await bookings.updateOne(
+      {
+        _id: booking._id,
+        renterId: payment.renterId,
+        bookingStatus: booking.bookingStatus,
+        paymentStatus: 'unpaid',
+        ...(wasExpiredHold ? { cancellationReason: 'payment_hold_expired' } : {}),
+      },
+      {
+        $set: {
+          ...(wasExpiredHold ? { bookingStatus: 'pending' } : {}),
+          paymentStatus: 'paid',
+          paymentTransactionId: payment.transactionId,
+          paidAt: now,
+          updatedAt: now,
+        },
+        ...(wasExpiredHold ? { $unset: { cancellationReason: '' } } : {}),
+      },
+    );
+    if (update.modifiedCount === 1) {
+      return bookings.findOne({ _id: booking._id });
+    }
+
+    booking = await bookings.findOne({ _id: booking._id, renterId: payment.renterId });
+    if (!booking) return null;
+  }
+  return null;
 }
 
 async function ensureSuccessfulPaymentIndex(transactions) {
@@ -370,7 +495,11 @@ export async function createStripeCheckout(request, response) {
   }
 }
 
-export async function handleStripeWebhook(request, response) {
+export async function handleStripeWebhook(
+  request,
+  response,
+  refundStripePayment = refundStripePaymentIntent,
+) {
   const signature = request.headers['stripe-signature'];
   if (typeof signature !== 'string') {
     return sendError(response, { statusCode: 400, message: 'Stripe webhook signature is missing.' });
@@ -407,7 +536,7 @@ export async function handleStripeWebhook(request, response) {
 
       const payments = getDB().collection('payments');
       const payment = await payments.findOne({ stripeCheckoutSessionId: session.id });
-      if (!payment || payment.status === 'failed') {
+      if (!payment) {
         return sendError(response, { statusCode: 404, message: 'Payment record for this Checkout session was not found.' });
       }
       if (
@@ -418,47 +547,117 @@ export async function handleStripeWebhook(request, response) {
       ) {
         return sendError(response, { statusCode: 400, message: 'Stripe Checkout session does not match the stored payment.' });
       }
-      if (payment.status === 'success') {
+      if (payment.status === 'refunded') {
+        return sendSuccess(response, { message: 'Stripe payment was already refunded.', data: { received: true } });
+      }
+
+      const bookings = getBookingsCollection();
+      const booking = await bookings.findOne({
+        _id: payment.bookingId,
+        renterId: payment.renterId,
+      });
+      const paymentIntentId = getPaymentIntentId(session.payment_intent);
+      if (
+        payment.status === 'success'
+        && booking?.paymentStatus === 'paid'
+        && booking.paymentTransactionId === payment.transactionId
+        && booking.refundStatus !== 'pending'
+        && booking.refundStatus !== 'failed'
+      ) {
         return sendSuccess(response, { message: 'Stripe event was already processed.', data: { received: true } });
       }
 
-      const bookingUpdate = await getBookingsCollection().updateOne(
-        {
-          _id: payment.bookingId,
-          renterId: payment.renterId,
-          bookingStatus: 'pending',
-          paymentStatus: 'unpaid',
-        },
-        {
-          $set: {
-            paymentStatus: 'paid',
-            paymentTransactionId: payment.transactionId,
-            paidAt: new Date(),
-            updatedAt: new Date(),
-          },
-        },
-      );
-      if (bookingUpdate.modifiedCount !== 1) {
-        const alreadyApplied = await getBookingsCollection().findOne({
-          _id: payment.bookingId,
-          paymentStatus: 'paid',
-          paymentTransactionId: payment.transactionId,
+      const now = new Date();
+      if (!booking) {
+        await refundCapturedStripePayment({
+          payment,
+          payments,
+          paymentIntentId,
+          reason: 'booking_not_found',
+          now,
+          refundStripePayment,
         });
-        if (!alreadyApplied) {
-          return sendError(response, { statusCode: 409, message: 'Booking is no longer eligible for this payment.' });
-        }
+        return sendSuccess(response, {
+          message: 'Stripe payment was refunded because its booking was unavailable.',
+          data: { received: true },
+        });
       }
 
+      if (
+        booking.paymentStatus === 'paid'
+        && booking.paymentTransactionId === payment.transactionId
+        && (booking.refundStatus === 'pending' || booking.refundStatus === 'failed')
+      ) {
+        await refundCapturedStripePayment({
+          payment,
+          booking,
+          payments,
+          paymentIntentId,
+          reason: booking.cancellationReason || 'payment_refund_pending',
+          now,
+          refundStripePayment,
+        });
+        return sendSuccess(response, {
+          message: 'Stripe payment refund was completed.',
+          data: { received: true },
+        });
+      }
+
+      const paidBooking = await claimStripePayment(bookings, booking, payment, now);
+      if (!paidBooking) {
+        await refundCapturedStripePayment({
+          payment,
+          booking,
+          payments,
+          paymentIntentId,
+          reason: 'booking_no_longer_eligible',
+          now,
+          refundStripePayment,
+        });
+        return sendSuccess(response, {
+          message: 'Stripe payment was refunded because the booking was no longer eligible.',
+          data: { received: true },
+        });
+      }
+
+      const equipment = await getDB().collection('equipment').findOne({
+        _id: paidBooking.equipmentId,
+      });
+      const availability = equipment
+        ? await getDateAvailability({
+            equipment,
+            startDate: paidBooking.startDate,
+            endDate: paidBooking.endDate,
+            excludeBookingId: paidBooking._id,
+          })
+        : null;
+
       await payments.updateOne(
-        { _id: payment._id, status: 'pending' },
+        { _id: payment._id, status: { $in: ['pending', 'failed', 'cancelled', 'success'] } },
         {
           $set: {
             status: 'success',
-            stripePaymentIntentId: typeof session.payment_intent === 'string' ? session.payment_intent : '',
-            updatedAt: new Date(),
+            stripePaymentIntentId: paymentIntentId,
+            updatedAt: now,
           },
         },
       );
+
+      if (!availability || paidBooking.quantity > availability.availableQuantity) {
+        await refundCapturedStripePayment({
+          payment: { ...payment, status: 'success', stripePaymentIntentId: paymentIntentId },
+          booking: paidBooking,
+          payments,
+          paymentIntentId,
+          reason: 'late_payment_inventory_unavailable',
+          now,
+          refundStripePayment,
+        });
+        return sendSuccess(response, {
+          message: 'Stripe payment was refunded because the equipment was no longer available.',
+          data: { received: true },
+        });
+      }
     } else if (
       event.type === 'checkout.session.expired'
       || event.type === 'checkout.session.async_payment_failed'
@@ -526,8 +725,9 @@ export async function getMyPayments(request, response) {
 }
 
 export async function createCheckout(request, response) {
-  // Rentora uses a clearly labelled demo payment flow in this deployment.
-  // Stripe handlers remain available for a future real integration, but are
-  // never called by the customer checkout endpoint.
-  return createDemoCheckout(request, response);
+  const { paymentMethod, outcome } = request.body ?? {};
+  if (paymentMethod !== undefined || outcome !== undefined) {
+    return createDemoCheckout(request, response);
+  }
+  return createStripeCheckout(request, response);
 }

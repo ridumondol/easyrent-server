@@ -1,10 +1,12 @@
 import cron from 'node-cron';
 import { getDB } from '../config/db.js';
 import { sendBookingCompletedEmails } from '../services/emailService.js';
+import { runPendingBookingLifecycle } from '../services/bookingLifecycleService.js';
 
 let scheduledTask;
 
 export async function runBookingCompletionJob(now = new Date()) {
+  const lifecycle = await runPendingBookingLifecycle(now);
   const bookings = getDB().collection('bookings');
   const completed = await bookings.find({
     bookingStatus: 'confirmed',
@@ -48,7 +50,11 @@ export async function runBookingCompletionJob(now = new Date()) {
     }
   }
 
-  return { completedCount: completed.length, notificationCount: notifications.length };
+  return {
+    ...lifecycle,
+    completedCount: completed.length,
+    notificationCount: notifications.length,
+  };
 }
 
 export function startBookingCompletionJob() {

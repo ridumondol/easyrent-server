@@ -2,7 +2,8 @@
 
 Express API for **Rentora**, an equipment-rental marketplace for customers and local equipment owners.
 
-- **Live URL:** Not deployed yet.
+- **Live API:** `https://easyrent-server-ifgf.onrender.com`
+- **Live client:** `https://easyrent-client.vercel.app`
 - **Local API:** `http://localhost:5000`
 - **Database:** MongoDB via Mongoose models/indexes and MongoDB collection operations.
 
@@ -12,7 +13,7 @@ Express API for **Rentora**, an equipment-rental marketplace for customers and l
 - One-time, hashed, 15-minute password reset links and authenticated password changes that revoke older sessions.
 - Approved equipment search/filtering/sorting/pagination, owner inventory, admin review queue, favorites, and customer reviews.
 - Server-priced booking requests with date-range inventory checks and paginated customer history.
-- Stripe Checkout in test mode; signature-verified webhooks update booking/payment records idempotently.
+- Stripe Checkout in test mode; signature-verified webhooks update booking/payment records idempotently and refund late payments when inventory is no longer available.
 - Admin and owner analytics, recurring booking completion job, SMTP completion notifications, and contact form storage.
 - Idempotent demo data seeding for three roles, approved and pending equipment, and reviews.
 
@@ -100,13 +101,13 @@ Stripe secrets private and never add them to Vercel or a `NEXT_PUBLIC_*` value.
 | `CORS_ORIGIN` | Optional additional frontend origins, comma-separated |
 
 In Stripe's test-mode Developers > Webhooks settings, register
-`https://<your-render-host>/api/payments/webhook` and subscribe to the four
+`https://easyrent-server-ifgf.onrender.com/api/payments/webhook` and subscribe to the four
 Checkout events listed above. Use that endpoint's signing secret in Render.
 The Render manifest declares the Stripe secrets as unsynchronized environment
 variables so they must be set privately in the Render dashboard.
 
 In Vercel, set `NEXT_PUBLIC_API_URL` to
-`https://<your-render-host>/api`, then rebuild the frontend. The success and
+`https://easyrent-server-ifgf.onrender.com/api`, then rebuild the frontend. The success and
 cancel redirects are derived from the backend `CLIENT_URL`. Keep Stripe in test
 mode on both Stripe and Render; do not use a live secret key or real card.
 
@@ -131,7 +132,12 @@ and safe SMTP error codes without logging credentials or reset tokens.
 Reset links use `CLIENT_URL`, expire after 15 minutes, and are single-use. The
 same SMTP settings are used for rental completion notifications. The booking
 completion job runs every five minutes by default; override with
-`BOOKING_COMPLETION_CRON`.
+`BOOKING_COMPLETION_CRON`. Unpaid booking holds expire after 30 minutes by
+default (`PENDING_BOOKING_HOLD_MINUTES`). Paid bookings remain reserved while
+awaiting owner approval; only paid bookings can be confirmed. If not accepted
+within 24 hours of payment, the job cancels the booking and issues a full
+refund. Refund failures are retried by the job, and late Stripe payment
+webhooks are accepted only if stock remains; otherwise the payment is refunded.
 
 The `users` collection gains reset-token digest/expiry fields and a token-version
 field. These are stored on existing user documents; the server creates a sparse

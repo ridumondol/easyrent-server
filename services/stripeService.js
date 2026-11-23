@@ -27,6 +27,13 @@ export function constructStripeWebhookEvent(payload, signature, secret) {
   return Stripe.webhooks.constructEvent(payload, signature, secret);
 }
 
+export function refundStripePaymentIntent(paymentIntentId, idempotencyKey) {
+  return getStripeClient().refunds.create(
+    { payment_intent: paymentIntentId },
+    { idempotencyKey },
+  );
+}
+
 export function getStripeCurrency() {
   return (process.env.STRIPE_CURRENCY || 'bdt').toLowerCase();
 }

@@ -13,8 +13,9 @@ export function getBookingsCollection() {
  * Build the query for bookings that reserve inventory over a date range.
  *
  * - Confirmed bookings always reserve stock.
- * - Pending bookings reserve stock only inside the short hold window, so an
- *   abandoned checkout cannot block an item forever.
+ * - Paid pending bookings reserve stock until the owner acts or the 24-hour
+ *   confirmation deadline triggers a refund.
+ * - Unpaid pending bookings reserve stock only inside the short hold window.
  * - Cancelled and completed bookings never reserve stock.
  *
  * The range uses half-open overlap: existing.start < requestedEnd &&
@@ -36,7 +37,15 @@ export function buildBlockingBookingsFilter({
     endDate: { $gt: startDate },
     $or: [
       { bookingStatus: 'confirmed' },
-      { bookingStatus: 'pending', createdAt: { $gte: holdCutoff } },
+      { bookingStatus: 'pending', paymentStatus: 'paid' },
+      {
+        bookingStatus: 'pending',
+        createdAt: { $gte: holdCutoff },
+        $or: [
+          { paymentStatus: 'unpaid' },
+          { paymentStatus: { $exists: false } },
+        ],
+      },
     ],
   };
 
