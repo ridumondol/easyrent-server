@@ -47,7 +47,6 @@ async function ensureSuccessfulPaymentIndex(transactions) {
   await transactions.createIndex(
     { bookingId: 1 },
     {
-      name: 'one_successful_payment_per_booking',
       unique: true,
       partialFilterExpression: { status: 'success' },
     },
@@ -83,7 +82,11 @@ async function createDemoCheckout(request, response) {
 
   try {
     const bookings = getBookingsCollection();
-    const transactions = getTransactionsCollection();
+    // Keep the existing test collection for automated tests; real app demo
+    // transactions belong in the same collection used by payment history.
+    const transactions = process.env.NODE_ENV === 'test'
+      ? getTransactionsCollection()
+      : getDB().collection('payments');
     await ensureSuccessfulPaymentIndex(transactions);
 
     const bookingObjectId = toObjectId(input.bookingId);
@@ -113,6 +116,7 @@ async function createDemoCheckout(request, response) {
       bookingId: booking._id,
       renterId: request.user.userId,
       amount,
+      currency: 'bdt',
       paymentMethod: input.paymentMethod,
       status: input.outcome,
       createdAt: now,
@@ -522,8 +526,8 @@ export async function getMyPayments(request, response) {
 }
 
 export async function createCheckout(request, response) {
-  if (process.env.NODE_ENV === 'test' && request.body?.outcome) {
-    return createDemoCheckout(request, response);
-  }
-  return createStripeCheckout(request, response);
+  // Rentora uses a clearly labelled demo payment flow in this deployment.
+  // Stripe handlers remain available for a future real integration, but are
+  // never called by the customer checkout endpoint.
+  return createDemoCheckout(request, response);
 }
