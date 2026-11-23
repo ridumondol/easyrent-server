@@ -18,6 +18,10 @@ const bookingSchema = new mongoose.Schema({
   bookingStatus: { type: String, enum: ['pending', 'confirmed', 'cancelled', 'completed'], default: 'pending' },
   paymentStatus: { type: String, enum: ['unpaid', 'paid', 'refunded'], default: 'unpaid' },
   paymentTransactionId: { type: String },
+  paidAt: { type: Date },
+  refundedAt: { type: Date },
+  cancellationReason: { type: String },
+  refundStatus: { type: String, enum: ['pending', 'processing', 'failed', 'succeeded'] },
   completionEmailStatus: { type: String, enum: ['pending', 'sent', 'failed'] },
   completionEmailSentAt: { type: Date },
 }, { collection: 'bookings', timestamps: true });

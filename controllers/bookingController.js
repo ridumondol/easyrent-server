@@ -363,23 +363,48 @@ export async function cancelBooking(request, response) {
       });
     }
 
-    const updatedPaymentStatus =
-      booking.paymentStatus === 'paid' ? 'refunded' : booking.paymentStatus;
+    if (booking.refundStatus) {
+      return sendError(response, {
+        statusCode: 409,
+        message: 'A refund is already being processed for this booking.',
+      });
+    }
+
+    const now = new Date();
+    const isPaid = booking.paymentStatus === 'paid';
 
     const result = await getBookingsCollection().findOneAndUpdate(
-      { _id: booking._id },
+      {
+        _id: booking._id,
+        bookingStatus: booking.bookingStatus,
+        paymentStatus: booking.paymentStatus,
+        refundStatus: { $exists: false },
+      },
       {
         $set: {
           bookingStatus: 'cancelled',
-          paymentStatus: updatedPaymentStatus,
-          updatedAt: new Date(),
+          ...(isPaid
+            ? {
+                cancellationReason: 'booking_cancelled',
+                refundStatus: 'pending',
+              }
+            : {}),
+          updatedAt: now,
         },
       },
       { returnDocument: 'after' },
     );
+    if (!result) {
+      return sendError(response, {
+        statusCode: 409,
+        message: 'Booking changed while cancellation was being processed. Please refresh and try again.',
+      });
+    }
 
     return sendSuccess(response, {
-      message: 'Booking cancelled successfully.',
+      message: isPaid
+        ? 'Booking cancelled. Your refund is being processed.'
+        : 'Booking cancelled successfully.',
       data: { booking: result },
     });
   } catch (error) {
@@ -423,6 +448,18 @@ export async function updateBookingStatus(request, response) {
           `Cannot change booking status from ${booking.bookingStatus} to ${bookingStatus}.`,
       });
     }
+    if (booking.refundStatus) {
+      return sendError(response, {
+        statusCode: 409,
+        message: 'A refund is being processed for this booking.',
+      });
+    }
+    if (bookingStatus === 'confirmed' && booking.paymentStatus !== 'paid') {
+      return sendError(response, {
+        statusCode: 400,
+        message: 'Only paid bookings can be confirmed.',
+      });
+    }
 
     // Re-validate inventory when moving a pending booking to confirmed,
     // otherwise stock could have been taken while the request was pending.
@@ -455,7 +492,11 @@ export async function updateBookingStatus(request, response) {
     }
 
     const result = await getBookingsCollection().findOneAndUpdate(
-      { _id: booking._id },
+      {
+        _id: booking._id,
+        bookingStatus: booking.bookingStatus,
+        refundStatus: { $exists: false },
+      },
       {
         $set: {
           bookingStatus,
@@ -464,6 +505,12 @@ export async function updateBookingStatus(request, response) {
       },
       { returnDocument: 'after' },
     );
+    if (!result) {
+      return sendError(response, {
+        statusCode: 409,
+        message: 'Booking status changed while this update was being processed. Please refresh and try again.',
+      });
+    }
 
     return sendSuccess(response, {
       message: `Booking ${bookingStatus} successfully.`,

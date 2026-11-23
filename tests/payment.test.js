@@ -6,20 +6,51 @@ import {
   api,
   registerUser,
   insertBookingDirect,
+  insertEquipmentDirect,
   getTestDb,
   closeTestDb,
   assertError,
   assertSuccess,
 } from './helpers.js';
+import { connectToDatabase, closeDatabase } from '../config/db.js';
 import { isStripeWebhookSecretConfigured } from '../services/stripeService.js';
+import { handleStripeWebhook } from '../controllers/paymentController.js';
 
 let renter;
 let otherRenter;
 let owner;
 const hasStripeWebhookConfiguration = isStripeWebhookSecretConfigured();
 
+async function callSignedWebhook(event, secret, refundStripePayment) {
+  const payload = JSON.stringify(event);
+  const signature = Stripe.webhooks.generateTestHeaderString({ payload, secret });
+  const response = {
+    statusCode: 200,
+    body: null,
+    status(statusCode) {
+      this.statusCode = statusCode;
+      return this;
+    },
+    json(body) {
+      this.body = body;
+      return this;
+    },
+  };
+
+  await handleStripeWebhook(
+    {
+      headers: { 'stripe-signature': signature },
+      body: Buffer.from(payload),
+    },
+    response,
+    refundStripePayment,
+  );
+  return response;
+}
+
 describe('Demo Payments API', () => {
   before(async () => {
+    await connectToDatabase();
     [renter, otherRenter, owner] = await Promise.all([
       registerUser('renter', 'demoPaymentRenter'),
       registerUser('renter', 'demoPaymentOtherRenter'),
@@ -27,7 +58,7 @@ describe('Demo Payments API', () => {
     ]);
   });
 
-  it('requires authentication and prevents paying another renter’s booking', async () => {
+  it('requires authentication and prevents paying another renterâ€™s booking', async () => {
     const booking = await insertBookingDirect({
       renterId: new ObjectId(renter.user.id ?? renter.user._id),
       bookingStatus: 'pending',
@@ -70,6 +101,156 @@ describe('Demo Payments API', () => {
     assert.match(result.body.message, /signature/i);
   });
 
+  it('accepts a late Stripe payment only when inventory remains', async () => {
+    const originalWebhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+    const webhookSecret = 'whsec_booking_inventory_test';
+    process.env.STRIPE_WEBHOOK_SECRET = webhookSecret;
+
+    try {
+      const { db } = await getTestDb();
+      const equipmentId = await insertEquipmentDirect({ quantity: 1 });
+      await insertBookingDirect({
+        equipmentId,
+        bookingStatus: 'confirmed',
+        quantity: 1,
+      });
+      const lateBooking = await insertBookingDirect({
+        equipmentId,
+        renterId: new ObjectId(renter.user.id ?? renter.user._id),
+        bookingStatus: 'cancelled',
+        paymentStatus: 'unpaid',
+        cancellationReason: 'payment_hold_expired',
+        createdAt: new Date(Date.now() - 31 * 60 * 1000),
+      });
+      const payment = {
+        transactionId: `late_payment_${lateBooking._id}`,
+        bookingId: lateBooking._id,
+        renterId: new ObjectId(renter.user.id ?? renter.user._id),
+        stripeCheckoutSessionId: `cs_test_late_${lateBooking._id}`,
+        amount: 300,
+        currency: 'bdt',
+        checkoutReservation: true,
+        status: 'failed',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+      await db.collection('payments').insertOne(payment);
+
+      let refundArgs;
+      const response = await callSignedWebhook({
+        id: `evt_late_${lateBooking._id}`,
+        object: 'event',
+        type: 'checkout.session.completed',
+        data: {
+          object: {
+            id: payment.stripeCheckoutSessionId,
+            payment_status: 'paid',
+            metadata: {
+              bookingId: lateBooking._id.toString(),
+              renterId: payment.renterId.toString(),
+            },
+            amount_total: 30000,
+            currency: 'bdt',
+            payment_intent: `pi_test_late_${lateBooking._id}`,
+          },
+        },
+      }, webhookSecret, async (paymentIntentId, idempotencyKey) => {
+        refundArgs = { paymentIntentId, idempotencyKey };
+        return { id: 're_test_late_refund' };
+      });
+
+      const storedBooking = await db.collection('bookings').findOne({ _id: lateBooking._id });
+      const storedPayment = await db.collection('payments').findOne({
+        bookingId: lateBooking._id,
+      });
+      assert.equal(response.statusCode, 200);
+      assert.equal(storedBooking.bookingStatus, 'cancelled');
+      assert.equal(storedBooking.paymentStatus, 'refunded');
+      assert.equal(storedPayment.status, 'refunded');
+      assert.deepEqual(refundArgs, {
+        paymentIntentId: `pi_test_late_${lateBooking._id}`,
+        idempotencyKey: `rentora-booking-refund-${lateBooking._id}`,
+      });
+
+      const availableEquipmentId = await insertEquipmentDirect({ quantity: 1 });
+      const availableLateBooking = await insertBookingDirect({
+        equipmentId: availableEquipmentId,
+        renterId: new ObjectId(renter.user.id ?? renter.user._id),
+        bookingStatus: 'cancelled',
+        paymentStatus: 'unpaid',
+        cancellationReason: 'payment_hold_expired',
+        createdAt: new Date(Date.now() - 31 * 60 * 1000),
+      });
+      const availablePayment = {
+        ...payment,
+        _id: new ObjectId(),
+        transactionId: `late_available_${availableLateBooking._id}`,
+        bookingId: availableLateBooking._id,
+        stripeCheckoutSessionId: `cs_test_available_${availableLateBooking._id}`,
+      };
+      await db.collection('payments').insertOne(availablePayment);
+      const availableResponse = await callSignedWebhook({
+        id: `evt_available_${availableLateBooking._id}`,
+        object: 'event',
+        type: 'checkout.session.completed',
+        data: {
+          object: {
+            id: availablePayment.stripeCheckoutSessionId,
+            payment_status: 'paid',
+            metadata: {
+              bookingId: availableLateBooking._id.toString(),
+              renterId: availablePayment.renterId.toString(),
+            },
+            amount_total: 30000,
+            currency: 'bdt',
+            payment_intent: `pi_test_available_${availableLateBooking._id}`,
+          },
+        },
+      }, webhookSecret, async () => {
+        assert.fail('A late payment with available stock must not be refunded.');
+      });
+      const availableStoredBooking = await db.collection('bookings').findOne({
+        _id: availableLateBooking._id,
+      });
+      assert.equal(availableResponse.statusCode, 200);
+      assert.equal(availableStoredBooking.bookingStatus, 'pending');
+      assert.equal(availableStoredBooking.paymentStatus, 'paid');
+    } finally {
+      if (originalWebhookSecret === undefined) {
+        delete process.env.STRIPE_WEBHOOK_SECRET;
+      } else {
+        process.env.STRIPE_WEBHOOK_SECRET = originalWebhookSecret;
+      }
+    }
+  });
+
+  it('routes bookingId-only checkout requests to Stripe', async () => {
+    const booking = await insertBookingDirect({
+      renterId: new ObjectId(renter.user.id ?? renter.user._id),
+      bookingStatus: 'pending',
+    });
+    const originalClientUrl = process.env.CLIENT_URL;
+    delete process.env.CLIENT_URL;
+
+    try {
+      assertError(
+        await api('/api/payments/checkout', {
+          method: 'POST',
+          token: renter.token,
+          body: { bookingId: booking._id.toString() },
+        }),
+        503,
+        'CLIENT_URL',
+      );
+    } finally {
+      if (originalClientUrl === undefined) {
+        delete process.env.CLIENT_URL;
+      } else {
+        process.env.CLIENT_URL = originalClientUrl;
+      }
+    }
+  });
+
   it('allows only one pending Stripe checkout reservation per booking', async () => {
     const { db } = await getTestDb();
     const bookingId = new ObjectId();
@@ -104,10 +285,13 @@ describe('Demo Payments API', () => {
     const bookings = db.collection('bookings');
     const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
     const renterId = new ObjectId(renter.user.id ?? renter.user._id);
+    const equipmentId = await insertEquipmentDirect({ quantity: 1 });
     const paidBooking = await insertBookingDirect({
+      equipmentId,
       renterId,
       bookingStatus: 'pending',
       paymentStatus: 'unpaid',
+      createdAt: new Date(Date.now() - 31 * 60 * 1000),
     });
     const paidPayment = {
       transactionId: `webhook_${paidBooking._id}`,
@@ -392,5 +576,6 @@ describe('Demo Payments API', () => {
 
   after(async () => {
     await closeTestDb();
+    await closeDatabase();
   });
 });

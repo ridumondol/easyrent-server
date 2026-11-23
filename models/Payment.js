@@ -6,6 +6,7 @@ const paymentSchema = new mongoose.Schema({
   transactionId: { type: String, required: true, unique: true },
   stripeCheckoutSessionId: { type: String, unique: true, sparse: true },
   stripePaymentIntentId: { type: String, default: '' },
+  stripeRefundId: { type: String, default: '' },
   paymentMethod: { type: String, enum: ['demo_card', 'bkash_demo', 'nagad_demo'] },
   checkoutReservation: { type: Boolean, default: false },
   productName: { type: String },
@@ -13,6 +14,7 @@ const paymentSchema = new mongoose.Schema({
   amount: { type: Number, required: true, min: 0 },
   currency: { type: String, default: 'bdt', lowercase: true },
   status: { type: String, enum: ['pending', 'success', 'failed', 'cancelled', 'refunded'], default: 'pending' },
+  refundedAt: { type: Date },
 }, { collection: 'payments', timestamps: true });
 
 paymentSchema.index({ renterId: 1, createdAt: -1 });

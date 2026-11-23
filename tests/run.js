@@ -16,6 +16,7 @@ const testFiles = [
   path.join(root, 'tests', 'auth.test.js'),
   path.join(root, 'tests', 'booking.test.js'),
   path.join(root, 'tests', 'payment.test.js'),
+  path.join(root, 'tests', 'bookingLifecycle.test.js'),
   path.join(root, 'tests', 'admin.test.js'),
   path.join(root, 'tests', 'regression.test.js'),
 ];
@@ -118,7 +119,7 @@ async function main() {
     TEST_DB_NAME: testDbName,
     TEST_BASE_URL: baseUrl,
     JWT_SECRET: process.env.JWT_SECRET ?? 'integration-test-secret',
-    CLIENT_URL: process.env.CLIENT_URL ?? 'http://localhost:3000',
+    CLIENT_URL: '',
     SMTP_HOST: '',
     SMTP_PORT: '',
     SMTP_USER: '',

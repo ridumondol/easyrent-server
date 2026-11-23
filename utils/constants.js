@@ -6,9 +6,8 @@ export const PAYMENT_STATUSES = ['unpaid', 'paid', 'refunded'];
 // Only these statuses reserve equipment inventory.
 export const INVENTORY_BLOCKING_STATUSES = ['pending', 'confirmed'];
 
-// A pending booking reserves stock only for a short window. If the renter
-// never confirms/pays, the hold expires so the equipment is not blocked
-// forever. Confirmed bookings always reserve stock.
+// Unpaid pending bookings reserve stock only for a short window. Paid pending
+// bookings remain reserved until the owner acts or the confirmation deadline.
 const configuredHoldMinutes = Number.parseInt(
   process.env.PENDING_BOOKING_HOLD_MINUTES ?? '30',
   10,

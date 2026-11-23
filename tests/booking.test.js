@@ -299,6 +299,18 @@ describe('Booking & Rental Management System', () => {
         }),
         201,
       ).booking;
+      assertSuccess(
+        await api('/api/payments/checkout', {
+          method: 'POST',
+          token: renterA.token,
+          body: {
+            bookingId: first._id,
+            paymentMethod: 'demo_card',
+            outcome: 'success',
+          },
+        }),
+        201,
+      );
 
       assertSuccess(
         await api(`/api/bookings/${first._id}/status`, {
@@ -711,13 +723,24 @@ describe('Booking & Rental Management System', () => {
       );
     });
 
-    it('marks a paid booking as refunded when cancelled', async () => {
+    it('queues a full refund when a paid booking is cancelled', async () => {
+      const paymentTransactionId = `cancel_paid_${new ObjectId()}`;
       const seeded = await insertBookingDirect({
         renterId: new ObjectId(renterA.user._id),
         ownerId: new ObjectId(ownerA.user._id),
         bookingStatus: 'confirmed',
         paymentStatus: 'paid',
+        paymentTransactionId,
       });
+      const { db } = await getTestDb();
+      await db.collection('paymentTransactions').insertOne({
+        bookingId: seeded._id,
+        renterId: seeded.renterId,
+        transactionId: paymentTransactionId,
+        paymentMethod: 'demo_card',
+        status: 'success',
+      });
+
       const data = assertSuccess(
         await api(`/api/bookings/${seeded._id}/cancel`, {
           method: 'PATCH',
@@ -725,7 +748,12 @@ describe('Booking & Rental Management System', () => {
         }),
       );
       assert.equal(data.booking.bookingStatus, 'cancelled');
-      assert.equal(data.booking.paymentStatus, 'refunded');
+      assert.equal(data.booking.paymentStatus, 'paid');
+      assert.equal(data.booking.refundStatus, 'pending');
+      const refundedTransaction = await db.collection('paymentTransactions').findOne({
+        bookingId: seeded._id,
+      });
+      assert.equal(refundedTransaction.status, 'success');
     });
   });
 
@@ -793,7 +821,41 @@ describe('Booking & Rental Management System', () => {
       );
     });
 
-    it('allows an owner to confirm a pending booking', async () => {
+    it('allows an owner to confirm a paid pending booking', async () => {
+      const equipmentId = await createEquipment(ownerA.token);
+      const booking = assertSuccess(
+        await api('/api/bookings', {
+          method: 'POST',
+          token: renterA.token,
+          body: bookingPayload(equipmentId),
+        }),
+        201,
+      ).booking;
+      assertSuccess(
+        await api('/api/payments/checkout', {
+          method: 'POST',
+          token: renterA.token,
+          body: {
+            bookingId: booking._id,
+            paymentMethod: 'demo_card',
+            outcome: 'success',
+          },
+        }),
+        201,
+      );
+
+      const data = assertSuccess(
+        await api(`/api/bookings/${booking._id}/status`, {
+          method: 'PATCH',
+          token: ownerA.token,
+          body: { bookingStatus: 'confirmed' },
+        }),
+      );
+      assert.equal(data.booking.bookingStatus, 'confirmed');
+      assert.equal(data.booking.paymentStatus, 'paid');
+    });
+
+    it('rejects confirmation of an unpaid pending booking', async () => {
       const equipmentId = await createEquipment(ownerA.token);
       const booking = assertSuccess(
         await api('/api/bookings', {
@@ -804,15 +866,15 @@ describe('Booking & Rental Management System', () => {
         201,
       ).booking;
 
-      const data = assertSuccess(
+      assertError(
         await api(`/api/bookings/${booking._id}/status`, {
           method: 'PATCH',
           token: ownerA.token,
           body: { bookingStatus: 'confirmed' },
         }),
+        400,
+        'Only paid bookings',
       );
-      assert.equal(data.booking.bookingStatus, 'confirmed');
-      assert.equal(data.booking.paymentStatus, 'unpaid');
     });
 
     it('allows an owner to reject a pending booking', async () => {
@@ -940,6 +1002,18 @@ describe('Booking & Rental Management System', () => {
         }),
         201,
       ).booking;
+      assertSuccess(
+        await api('/api/payments/checkout', {
+          method: 'POST',
+          token: renterA.token,
+          body: {
+            bookingId: pending._id,
+            paymentMethod: 'demo_card',
+            outcome: 'success',
+          },
+        }),
+        201,
+      );
 
       // Another party takes all stock while the booking is still pending.
       await insertBookingDirect({

@@ -82,7 +82,12 @@ describe('Validation & availability helpers', () => {
 
     assert.deepEqual(filter.bookingStatus, { $in: ['pending', 'confirmed'] });
     assert.ok(filter.$or.some((branch) => branch.bookingStatus === 'confirmed'));
-    assert.ok(filter.$or.some((branch) => branch.bookingStatus === 'pending'));
+    assert.ok(filter.$or.some(
+      (branch) => branch.bookingStatus === 'pending' && branch.paymentStatus === 'paid',
+    ));
+    assert.ok(filter.$or.some(
+      (branch) => branch.bookingStatus === 'pending' && branch.createdAt?.$gte,
+    ));
     assert.deepEqual(filter.startDate, { $lt: parseRentalDate('2030-05-14') });
     assert.deepEqual(filter.endDate, { $gt: parseRentalDate('2030-05-10') });
   });
