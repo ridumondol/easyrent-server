@@ -4,14 +4,14 @@ let stripeClient;
 
 export function isStripeSecretKeyConfigured(secretKey = process.env.STRIPE_SECRET_KEY) {
   return typeof secretKey === 'string'
-    && /^sk_test_\S+$/.test(secretKey)
-    && !/(your_|replace_with|placeholder)/i.test(secretKey);
+    && /^sk_test_[A-Za-z0-9]{16,}$/.test(secretKey)
+    && !/(your|replace|placeholder|example|dummy|changeme)/i.test(secretKey);
 }
 
 export function isStripeWebhookSecretConfigured(secret = process.env.STRIPE_WEBHOOK_SECRET) {
   return typeof secret === 'string'
-    && /^whsec_\S+$/.test(secret)
-    && !/(your_|replace_with|placeholder)/i.test(secret);
+    && /^whsec_[A-Za-z0-9_-]{16,}$/.test(secret)
+    && !/(your|replace|placeholder|example|dummy|changeme)/i.test(secret);
 }
 
 export function getStripeClient() {

@@ -465,6 +465,14 @@ export async function createStripeCheckout(request, response) {
       metadata: {
         bookingId: bookingObjectId.toString(),
         renterId: request.user.userId.toString(),
+        transactionId: reservation.transactionId,
+      },
+      payment_intent_data: {
+        metadata: {
+          bookingId: bookingObjectId.toString(),
+          renterId: request.user.userId.toString(),
+          transactionId: reservation.transactionId,
+        },
       },
       success_url: successUrl,
       cancel_url: cancelUrl,
@@ -511,8 +519,8 @@ export async function handleStripeWebhook(
   let event;
   try {
     event = constructStripeWebhookEvent(request.body, signature, process.env.STRIPE_WEBHOOK_SECRET);
-  } catch (error) {
-    console.warn('Stripe webhook signature verification failed:', error.message);
+  } catch {
+    console.warn('Stripe webhook signature verification failed.');
     return sendError(response, { statusCode: 400, message: 'Invalid Stripe webhook signature.' });
   }
 
@@ -665,8 +673,54 @@ export async function handleStripeWebhook(
       const session = event.data.object;
       await getDB().collection('payments').updateOne(
         { stripeCheckoutSessionId: session.id, status: 'pending' },
-        { $set: { status: 'failed', updatedAt: new Date() } },
+        { $set: { status: event.type === 'checkout.session.expired' ? 'cancelled' : 'failed', updatedAt: new Date() } },
       );
+    } else if (event.type === 'payment_intent.payment_failed') {
+      const paymentIntent = event.data.object;
+      await getDB().collection('payments').updateOne(
+        {
+          $or: [
+            { stripePaymentIntentId: paymentIntent.id },
+            ...(typeof paymentIntent.metadata?.transactionId === 'string'
+              ? [{ transactionId: paymentIntent.metadata.transactionId }]
+              : []),
+          ],
+          status: 'pending',
+        },
+        { $set: { status: 'failed', stripePaymentIntentId: paymentIntent.id, updatedAt: new Date() } },
+      );
+    } else if (event.type === 'charge.refunded') {
+      const charge = event.data.object;
+      const paymentIntentId = getPaymentIntentId(charge.payment_intent);
+      if (paymentIntentId) {
+        const payments = getDB().collection('payments');
+        const payment = await payments.findOne({ stripePaymentIntentId: paymentIntentId });
+        if (payment && charge.amount_refunded >= charge.amount) {
+          const refundId = charge.refunds?.data?.[0]?.id;
+          if (payment.status !== 'refunded') {
+            await payments.updateOne(
+              { _id: payment._id, status: { $ne: 'refunded' } },
+              {
+                $set: {
+                  status: 'refunded',
+                  refundedAt: new Date(),
+                  updatedAt: new Date(),
+                  ...(refundId ? { stripeRefundId: refundId } : {}),
+                },
+              },
+            );
+          }
+          await getBookingsCollection().updateOne(
+            {
+              _id: payment.bookingId,
+              renterId: payment.renterId,
+              paymentTransactionId: payment.transactionId,
+              paymentStatus: 'paid',
+            },
+            { $set: { paymentStatus: 'refunded', refundStatus: 'succeeded', refundedAt: new Date(), updatedAt: new Date() } },
+          );
+        }
+      }
     }
 
     return sendSuccess(response, { message: 'Stripe event received.', data: { received: true } });
