@@ -335,7 +335,7 @@ describe('Demo Payments API', () => {
         user: { userId: renter.user.id ?? renter.user._id },
       };
       const firstResponse = makeResponse();
-      await createStripeCheckout(request, firstResponse, stripeStub);
+      await createStripeCheckout(request, firstResponse, { stripeClient: stripeStub });
       assert.equal(firstResponse.statusCode, 201);
       assert.equal(firstResponse.body.data.checkoutUrl, 'https://checkout.stripe.test/session');
       assert.equal(createParams.line_items[0].price_data.unit_amount, 3705);
@@ -352,7 +352,7 @@ describe('Demo Payments API', () => {
       );
 
       const retryResponse = makeResponse();
-      await createStripeCheckout(request, retryResponse, stripeStub);
+      await createStripeCheckout(request, retryResponse, { stripeClient: stripeStub });
       assert.equal(retryResponse.statusCode, 200);
       assert.equal(retryResponse.body.data.sessionId, `cs_test_${booking._id}`);
       assert.equal(createCount, 1);
@@ -364,10 +364,12 @@ describe('Demo Payments API', () => {
         query: { session_id: `cs_test_${booking._id}` },
         user: { userId: renter.user.id ?? renter.user._id },
       }, verificationResponse, {
-        checkout: { sessions: { async retrieve(sessionId) {
-          retrievedSessionId = sessionId;
-          return { id: sessionId, status: 'complete', payment_status: 'paid', livemode: false };
-        } } },
+        stripeClient: {
+          checkout: { sessions: { async retrieve(sessionId) {
+            retrievedSessionId = sessionId;
+            return { id: sessionId, status: 'complete', payment_status: 'paid', livemode: false };
+          } } },
+        },
       });
       assert.equal(verificationResponse.statusCode, 200);
       assert.equal(retrievedSessionId, `cs_test_${booking._id}`);
@@ -381,8 +383,10 @@ describe('Demo Payments API', () => {
   });
 
   it('forces Stripe Checkout in production even when demo fields are submitted', async () => {
+    const equipmentId = await insertEquipmentDirect({ quantity: 1, title: 'Production checkout test equipment' });
     const booking = await insertBookingDirect({
-      renterId: new ObjectId(renter.user.id ?? renter.user._id),
+equipmentId,
+renterId: new ObjectId(renter.user.id ?? renter.user._id),
       bookingStatus: 'pending',
       paymentStatus: 'unpaid',
     });
@@ -408,10 +412,12 @@ describe('Demo Payments API', () => {
         body: { bookingId: booking._id.toString(), paymentMethod: 'demo_card', outcome: 'success' },
         user: { userId: renter.user.id ?? renter.user._id },
       }, response, {
-        checkout: { sessions: { async create() {
-          stripeCalled = true;
-          return { id: `cs_test_prod_${booking._id}`, url: 'https://checkout.stripe.test/session' };
-        } } },
+        stripeClient: {
+          checkout: { sessions: { async create() {
+            stripeCalled = true;
+            return { id: `cs_test_prod_${booking._id}`, url: 'https://checkout.stripe.test/session' };
+          } } },
+        },
       });
       assert.equal(response.statusCode, 201);
       assert.equal(stripeCalled, true);
