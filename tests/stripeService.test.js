@@ -1,11 +1,26 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  getStripeClient,
   isStripeSecretKeyConfigured,
   isStripeWebhookSecretConfigured,
 } from '../services/stripeService.js';
 
 describe('Stripe environment configuration validation', () => {
+  it('initializes the installed Stripe SDK with Checkout session methods', () => {
+    const originalKey = process.env.STRIPE_SECRET_KEY;
+    process.env.STRIPE_SECRET_KEY = 'sk_test_1234567890abcdefghijkl';
+
+    try {
+      const stripe = getStripeClient();
+      assert.equal(typeof stripe.checkout.sessions.create, 'function');
+      assert.equal(typeof stripe.checkout.sessions.retrieve, 'function');
+    } finally {
+      if (originalKey === undefined) delete process.env.STRIPE_SECRET_KEY;
+      else process.env.STRIPE_SECRET_KEY = originalKey;
+    }
+  });
+
   it('accepts a Stripe test secret and rejects other key types and placeholders', () => {
     assert.equal(isStripeSecretKeyConfigured('sk_test_1234567890abcdef'), true);
     for (const key of [

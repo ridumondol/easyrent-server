@@ -318,7 +318,7 @@ async function createDemoCheckout(request, response) {
   }
 }
 
-export async function createStripeCheckout(request, response, stripeClientOverride) {
+export async function createStripeCheckout(request, response, dependencies = {}) {
   const { bookingId } = request.body ?? {};
   if (!isValidObjectId(bookingId)) {
     return sendError(response, { statusCode: 400, message: 'A valid bookingId is required.' });
@@ -334,7 +334,7 @@ export async function createStripeCheckout(request, response, stripeClientOverri
   }
 
   try {
-    const stripe = stripeClientOverride ?? getStripeClient();
+    const stripe = dependencies?.stripeClient ?? getStripeClient();
     const bookings = getBookingsCollection();
     const payments = getDB().collection('payments');
     const bookingObjectId = toObjectId(bookingId);
@@ -743,7 +743,7 @@ export async function handleStripeWebhook(
   }
 }
 
-export async function verifyPayment(request, response, stripeClientOverride) {
+export async function verifyPayment(request, response, dependencies = {}) {
   const { bookingId } = request.params;
   if (!isValidObjectId(bookingId)) {
     return sendError(response, { statusCode: 400, message: 'Invalid booking ID.' });
@@ -769,7 +769,7 @@ export async function verifyPayment(request, response, stripeClientOverride) {
       if (!isStripeSecretKeyConfigured()) {
         return sendError(response, { statusCode: 503, message: 'Stripe payment verification is unavailable.' });
       }
-      stripeSession = await (stripeClientOverride ?? getStripeClient()).checkout.sessions.retrieve(payment.stripeCheckoutSessionId);
+      stripeSession = await (dependencies?.stripeClient ?? getStripeClient()).checkout.sessions.retrieve(payment.stripeCheckoutSessionId);
       if (stripeSession.livemode === true) {
         return sendError(response, { statusCode: 502, message: 'A live-mode Stripe session is not accepted.' });
       }
@@ -812,7 +812,7 @@ export async function getMyPayments(request, response) {
   }
 }
 
-export async function createCheckout(request, response, stripeClientOverride) {
+export async function createCheckout(request, response, dependencies = {}) {
   const { paymentMethod, outcome } = request.body ?? {};
   if (paymentMethod !== undefined || outcome !== undefined) {
     if (process.env.NODE_ENV !== 'production' && process.env.ENABLE_DEMO_PAYMENTS === 'true') {
@@ -822,5 +822,5 @@ export async function createCheckout(request, response, stripeClientOverride) {
       return sendError(response, { statusCode: 403, message: 'Demo payments are disabled. Use Stripe Checkout.' });
     }
   }
-  return createStripeCheckout(request, response, stripeClientOverride);
+  return createStripeCheckout(request, response, dependencies);
 }
