@@ -42,6 +42,15 @@ function calculateBookingAmount(booking) {
   return Number.isSafeInteger(amountInCents) && amountInCents > 0 ? amount : null;
 }
 
+function calculateBookingUnitAmount(booking) {
+  if (!isPositiveNumber(booking.pricePerDay) || !isPositiveInteger(booking.totalDays)) return null;
+  const amount = booking.rentalType
+    ? calculateRentalAmount(booking.pricePerDay, 1, booking.totalDays, booking.rentalType)
+    : calculateTotalAmount(booking.pricePerDay, 1, booking.totalDays);
+  const amountInCents = Math.round(amount * 100);
+  return Number.isSafeInteger(amountInCents) && amountInCents > 0 ? amount : null;
+}
+
 function getPendingHoldCutoff(now) {
   return new Date(now.getTime() - PENDING_HOLD_MINUTES * 60 * 1000);
 }
@@ -309,7 +318,7 @@ async function createDemoCheckout(request, response) {
   }
 }
 
-export async function createStripeCheckout(request, response) {
+export async function createStripeCheckout(request, response, stripeClientOverride) {
   const { bookingId } = request.body ?? {};
   if (!isValidObjectId(bookingId)) {
     return sendError(response, { statusCode: 400, message: 'A valid bookingId is required.' });
@@ -318,11 +327,14 @@ export async function createStripeCheckout(request, response) {
     return sendError(response, { statusCode: 503, message: 'CLIENT_URL is not configured for checkout redirects.' });
   }
   if (!isStripeSecretKeyConfigured()) {
-    return sendError(response, { statusCode: 503, message: 'Stripe payments are not configured.' });
+    return sendError(response, {
+      statusCode: 503,
+      message: 'Stripe payments are unavailable. Configure a valid Stripe test secret key (sk_test_...) in the server environment.',
+    });
   }
 
   try {
-    const stripe = getStripeClient();
+    const stripe = stripeClientOverride ?? getStripeClient();
     const bookings = getBookingsCollection();
     const payments = getDB().collection('payments');
     const bookingObjectId = toObjectId(bookingId);
@@ -343,7 +355,8 @@ export async function createStripeCheckout(request, response) {
       return sendError(response, { statusCode: 400, message: 'The pending booking hold has expired.' });
     }
     const amount = calculateBookingAmount(booking);
-    if (amount === null) {
+    const unitAmount = calculateBookingUnitAmount(booking);
+    if (amount === null || unitAmount === null || Math.round(unitAmount * booking.quantity * 100) !== Math.round(amount * 100)) {
       return sendError(response, { statusCode: 400, message: 'Booking pricing is invalid and cannot be paid.' });
     }
 
@@ -375,7 +388,7 @@ export async function createStripeCheckout(request, response) {
       if (existingSession.status === 'expired') {
         await payments.updateOne(
           { _id: existingPayment._id, status: 'pending' },
-          { $set: { status: 'failed', updatedAt: now } },
+          { $set: { status: 'cancelled', updatedAt: now } },
         );
         existingPayment = null;
       } else {
@@ -450,21 +463,29 @@ export async function createStripeCheckout(request, response) {
       });
     }
 
-    const successUrl = new URL('/payment/success?session_id={CHECKOUT_SESSION_ID}', process.env.CLIENT_URL).toString();
-    const cancelUrl = new URL('/customer/bookings?payment=cancelled', process.env.CLIENT_URL).toString();
+    const successUrl = new URL(`/payment/success?booking_id=${bookingObjectId}&session_id={CHECKOUT_SESSION_ID}`, process.env.CLIENT_URL).toString();
+    const cancelUrl = new URL(`/payment/cancelled?booking_id=${bookingObjectId}`, process.env.CLIENT_URL).toString();
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
       line_items: [{
         price_data: {
           currency: reservation.currency,
-          unit_amount: Math.round(reservation.amount * 100),
+          unit_amount: Math.round(unitAmount * 100),
           product_data: { name: reservation.productName || equipment.title },
         },
-        quantity: 1,
+        quantity: booking.quantity,
       }],
       metadata: {
         bookingId: bookingObjectId.toString(),
         renterId: request.user.userId.toString(),
+        transactionId: reservation.transactionId,
+      },
+      payment_intent_data: {
+        metadata: {
+          bookingId: bookingObjectId.toString(),
+          renterId: request.user.userId.toString(),
+          transactionId: reservation.transactionId,
+        },
       },
       success_url: successUrl,
       cancel_url: cancelUrl,
@@ -490,7 +511,7 @@ export async function createStripeCheckout(request, response) {
       data: { checkoutUrl: session.url, sessionId: session.id },
     });
   } catch (error) {
-    console.error('Stripe checkout creation failed:', error);
+    console.error('Stripe checkout creation failed:', error?.message ?? error);
     return sendError(response, { statusCode: 502, message: 'Unable to create a Stripe Checkout session.' });
   }
 }
@@ -511,8 +532,8 @@ export async function handleStripeWebhook(
   let event;
   try {
     event = constructStripeWebhookEvent(request.body, signature, process.env.STRIPE_WEBHOOK_SECRET);
-  } catch (error) {
-    console.warn('Stripe webhook signature verification failed:', error.message);
+  } catch {
+    console.warn('Stripe webhook signature verification failed.');
     return sendError(response, { statusCode: 400, message: 'Invalid Stripe webhook signature.' });
   }
 
@@ -665,18 +686,64 @@ export async function handleStripeWebhook(
       const session = event.data.object;
       await getDB().collection('payments').updateOne(
         { stripeCheckoutSessionId: session.id, status: 'pending' },
-        { $set: { status: 'failed', updatedAt: new Date() } },
+        { $set: { status: event.type === 'checkout.session.expired' ? 'cancelled' : 'failed', updatedAt: new Date() } },
       );
+    } else if (event.type === 'payment_intent.payment_failed') {
+      const paymentIntent = event.data.object;
+      await getDB().collection('payments').updateOne(
+        {
+          $or: [
+            { stripePaymentIntentId: paymentIntent.id },
+            ...(typeof paymentIntent.metadata?.transactionId === 'string'
+              ? [{ transactionId: paymentIntent.metadata.transactionId }]
+              : []),
+          ],
+          status: 'pending',
+        },
+        { $set: { status: 'failed', stripePaymentIntentId: paymentIntent.id, updatedAt: new Date() } },
+      );
+    } else if (event.type === 'charge.refunded') {
+      const charge = event.data.object;
+      const paymentIntentId = getPaymentIntentId(charge.payment_intent);
+      if (paymentIntentId) {
+        const payments = getDB().collection('payments');
+        const payment = await payments.findOne({ stripePaymentIntentId: paymentIntentId });
+        if (payment && charge.amount_refunded >= charge.amount) {
+          const refundId = charge.refunds?.data?.[0]?.id;
+          if (payment.status !== 'refunded') {
+            await payments.updateOne(
+              { _id: payment._id, status: { $ne: 'refunded' } },
+              {
+                $set: {
+                  status: 'refunded',
+                  refundedAt: new Date(),
+                  updatedAt: new Date(),
+                  ...(refundId ? { stripeRefundId: refundId } : {}),
+                },
+              },
+            );
+          }
+          await getBookingsCollection().updateOne(
+            {
+              _id: payment.bookingId,
+              renterId: payment.renterId,
+              paymentTransactionId: payment.transactionId,
+              paymentStatus: 'paid',
+            },
+            { $set: { paymentStatus: 'refunded', refundStatus: 'succeeded', refundedAt: new Date(), updatedAt: new Date() } },
+          );
+        }
+      }
     }
 
     return sendSuccess(response, { message: 'Stripe event received.', data: { received: true } });
   } catch (error) {
-    console.error('Stripe webhook processing failed:', error);
+    console.error('Stripe webhook processing failed:', error?.message ?? error);
     return sendError(response, { statusCode: 500, message: 'Stripe webhook could not be processed.' });
   }
 }
 
-export async function verifyPayment(request, response) {
+export async function verifyPayment(request, response, stripeClientOverride) {
   const { bookingId } = request.params;
   if (!isValidObjectId(bookingId)) {
     return sendError(response, { statusCode: 400, message: 'Invalid booking ID.' });
@@ -689,6 +756,25 @@ export async function verifyPayment(request, response) {
       return sendError(response, { statusCode: 403, message: 'You are not authorized to view this payment.' });
     }
 
+    const payment = await getDB().collection('payments').findOne({
+      bookingId: booking._id,
+      renterId: request.user.userId,
+    });
+    let stripeSession = null;
+    if (payment?.stripeCheckoutSessionId) {
+      const requestedSessionId = request.query.session_id;
+      if (requestedSessionId && requestedSessionId !== payment.stripeCheckoutSessionId) {
+        return sendError(response, { statusCode: 404, message: 'Checkout session was not found for this booking.' });
+      }
+      if (!isStripeSecretKeyConfigured()) {
+        return sendError(response, { statusCode: 503, message: 'Stripe payment verification is unavailable.' });
+      }
+      stripeSession = await (stripeClientOverride ?? getStripeClient()).checkout.sessions.retrieve(payment.stripeCheckoutSessionId);
+      if (stripeSession.livemode === true) {
+        return sendError(response, { statusCode: 502, message: 'A live-mode Stripe session is not accepted.' });
+      }
+    }
+
     return sendSuccess(response, {
       message: 'Payment status retrieved successfully.',
       data: {
@@ -696,6 +782,8 @@ export async function verifyPayment(request, response) {
         bookingStatus: booking.bookingStatus,
         paymentStatus: booking.paymentStatus,
         paymentTransactionId: booking.paymentTransactionId ?? null,
+        stripeSessionStatus: stripeSession?.status ?? null,
+        stripePaymentStatus: stripeSession?.payment_status ?? null,
       },
     });
   } catch (error) {
@@ -724,10 +812,15 @@ export async function getMyPayments(request, response) {
   }
 }
 
-export async function createCheckout(request, response) {
+export async function createCheckout(request, response, stripeClientOverride) {
   const { paymentMethod, outcome } = request.body ?? {};
   if (paymentMethod !== undefined || outcome !== undefined) {
-    return createDemoCheckout(request, response);
+    if (process.env.NODE_ENV !== 'production' && process.env.ENABLE_DEMO_PAYMENTS === 'true') {
+      return createDemoCheckout(request, response);
+    }
+    if (process.env.NODE_ENV !== 'production') {
+      return sendError(response, { statusCode: 403, message: 'Demo payments are disabled. Use Stripe Checkout.' });
+    }
   }
-  return createStripeCheckout(request, response);
+  return createStripeCheckout(request, response, stripeClientOverride);
 }

@@ -81,11 +81,27 @@ stripe listen --forward-to localhost:5000/api/payments/webhook
 ```
 
 Copy the signing secret printed by Stripe CLI into `STRIPE_WEBHOOK_SECRET`.
-Enable `checkout.session.completed`, `checkout.session.expired`,
-`checkout.session.async_payment_succeeded`, and
-`checkout.session.async_payment_failed` for the deployed webhook endpoint. A
+The required private server environment values are `STRIPE_SECRET_KEY`,
+`STRIPE_WEBHOOK_SECRET`, `STRIPE_CURRENCY` (defaults to `bdt`), and `CLIENT_URL`.
+The browser calls the API to create Checkout; Stripe secrets must never be set
+in the client or in a `NEXT_PUBLIC_*` variable. Only `sk_test_...` keys are
+accepted. `ENABLE_DEMO_PAYMENTS=true` optionally enables simulated payments in
+non-production environments; production always routes checkout to Stripe.
+
+Subscribe the webhook to `checkout.session.completed`,
+`checkout.session.expired`, `checkout.session.async_payment_succeeded`,
+`checkout.session.async_payment_failed`, `payment_intent.payment_failed`, and
+`charge.refunded` for the deployed endpoint. A
 booking has one active checkout reservation; retries reuse the same Stripe
 idempotency key until that session succeeds, expires, or fails.
+
+To test locally, keep the `stripe listen --forward-to localhost:5000/api/payments/webhook`
+process running, copy its `whsec_...` value into the server `.env`, and restart
+the API. Create a pending booking in Rentora and use **Pay now**. Complete
+Checkout with Stripe's test card `4242 4242 4242 4242`, any future expiry date,
+and any CVC. The CLI forwards the signed event to the local API. Also test a
+cancelled Checkout and confirm the booking remains unpaid. Never use live-mode
+keys or real card details for this project.
 
 ### Render and Vercel payment configuration
 
@@ -101,8 +117,10 @@ Stripe secrets private and never add them to Vercel or a `NEXT_PUBLIC_*` value.
 | `CORS_ORIGIN` | Optional additional frontend origins, comma-separated |
 
 In Stripe's test-mode Developers > Webhooks settings, register
-`https://easyrent-server-ifgf.onrender.com/api/payments/webhook` and subscribe to the four
-Checkout events listed above. Use that endpoint's signing secret in Render.
+`https://easyrent-server-ifgf.onrender.com/api/payments/webhook` and subscribe to
+`checkout.session.completed`, `checkout.session.expired`,
+`checkout.session.async_payment_succeeded`, `checkout.session.async_payment_failed`,
+`payment_intent.payment_failed`, and `charge.refunded`. Use that endpoint's signing secret in Render.
 The Render manifest declares the Stripe secrets as unsynchronized environment
 variables so they must be set privately in the Render dashboard.
 

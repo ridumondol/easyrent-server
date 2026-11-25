@@ -13,13 +13,11 @@ import {
   assertSuccess,
 } from './helpers.js';
 import { connectToDatabase, closeDatabase } from '../config/db.js';
-import { isStripeWebhookSecretConfigured } from '../services/stripeService.js';
-import { handleStripeWebhook } from '../controllers/paymentController.js';
+import { createCheckout, createStripeCheckout, handleStripeWebhook, verifyPayment } from '../controllers/paymentController.js';
 
 let renter;
 let otherRenter;
 let owner;
-const hasStripeWebhookConfiguration = isStripeWebhookSecretConfigured();
 
 async function callSignedWebhook(event, secret, refundStripePayment) {
   const payload = JSON.stringify(event);
@@ -169,7 +167,7 @@ describe('Demo Payments API', () => {
       assert.equal(storedPayment.status, 'refunded');
       assert.deepEqual(refundArgs, {
         paymentIntentId: `pi_test_late_${lateBooking._id}`,
-        idempotencyKey: `rentora-booking-refund-${lateBooking._id}`,
+        idempotencyKey: `rentora-payment-refund-${payment.transactionId}`,
       });
 
       const availableEquipmentId = await insertEquipmentDirect({ quantity: 1 });
@@ -277,9 +275,161 @@ describe('Demo Payments API', () => {
     );
   });
 
-  it('verifies Stripe signatures and processes payment and failure events', {
-    skip: !hasStripeWebhookConfiguration,
-  }, async () => {
+  it('creates one Stripe Checkout session using trusted booking pricing and reuses it on retry', async () => {
+    const equipmentId = await insertEquipmentDirect({ quantity: 3, title: 'Test equipment' });
+    const booking = await insertBookingDirect({
+      equipmentId,
+      renterId: new ObjectId(renter.user.id ?? renter.user._id),
+      bookingStatus: 'pending',
+      paymentStatus: 'unpaid',
+      pricePerDay: 12.35,
+      quantity: 2,
+      totalDays: 3,
+      totalAmount: 0.01,
+    });
+    const originalKey = process.env.STRIPE_SECRET_KEY;
+    const originalClientUrl = process.env.CLIENT_URL;
+    process.env.STRIPE_SECRET_KEY = 'sk_test_1234567890abcdefghijkl';
+    process.env.CLIENT_URL = 'https://rentora.example';
+
+    let createCount = 0;
+    let createParams;
+    let createOptions;
+    const stripeStub = {
+      checkout: {
+        sessions: {
+          async create(params, options) {
+            createCount += 1;
+            createParams = params;
+            createOptions = options;
+            return {
+              id: `cs_test_${booking._id}`,
+              url: 'https://checkout.stripe.test/session',
+              status: 'open',
+              expires_at: Math.floor(Date.now() / 1000) + 3600,
+            };
+          },
+          async retrieve() {
+            return {
+              id: `cs_test_${booking._id}`,
+              url: 'https://checkout.stripe.test/session',
+              status: 'open',
+            };
+          },
+        },
+      },
+    };
+
+    function makeResponse() {
+      return {
+        statusCode: 200,
+        body: null,
+        status(statusCode) { this.statusCode = statusCode; return this; },
+        json(body) { this.body = body; return this; },
+      };
+    }
+
+    try {
+      const request = {
+        body: { bookingId: booking._id.toString(), amount: 0.01 },
+        user: { userId: renter.user.id ?? renter.user._id },
+      };
+      const firstResponse = makeResponse();
+      await createStripeCheckout(request, firstResponse, stripeStub);
+      assert.equal(firstResponse.statusCode, 201);
+      assert.equal(firstResponse.body.data.checkoutUrl, 'https://checkout.stripe.test/session');
+      assert.equal(createParams.line_items[0].price_data.unit_amount, 3705);
+      assert.equal(createParams.line_items[0].quantity, 2);
+      assert.equal(createParams.mode, 'payment');
+      assert.equal(createParams.metadata.bookingId, booking._id.toString());
+      assert.equal(createParams.payment_intent_data.metadata.transactionId, createOptions.idempotencyKey);
+      assert.match(createParams.success_url, /booking_id=.*session_id=/);
+      assert.match(createParams.cancel_url, /payment\/cancelled\?booking_id=/);
+      const { db } = await getTestDb();
+      assert.equal(
+        (await db.collection('payments').findOne({ bookingId: booking._id })).stripeCheckoutSessionId,
+        `cs_test_${booking._id}`,
+      );
+
+      const retryResponse = makeResponse();
+      await createStripeCheckout(request, retryResponse, stripeStub);
+      assert.equal(retryResponse.statusCode, 200);
+      assert.equal(retryResponse.body.data.sessionId, `cs_test_${booking._id}`);
+      assert.equal(createCount, 1);
+
+      let retrievedSessionId;
+      const verificationResponse = makeResponse();
+      await verifyPayment({
+        params: { bookingId: booking._id.toString() },
+        query: { session_id: `cs_test_${booking._id}` },
+        user: { userId: renter.user.id ?? renter.user._id },
+      }, verificationResponse, {
+        checkout: { sessions: { async retrieve(sessionId) {
+          retrievedSessionId = sessionId;
+          return { id: sessionId, status: 'complete', payment_status: 'paid', livemode: false };
+        } } },
+      });
+      assert.equal(verificationResponse.statusCode, 200);
+      assert.equal(retrievedSessionId, `cs_test_${booking._id}`);
+      assert.equal(verificationResponse.body.data.stripePaymentStatus, 'paid');
+    } finally {
+      if (originalKey === undefined) delete process.env.STRIPE_SECRET_KEY;
+      else process.env.STRIPE_SECRET_KEY = originalKey;
+      if (originalClientUrl === undefined) delete process.env.CLIENT_URL;
+      else process.env.CLIENT_URL = originalClientUrl;
+    }
+  });
+
+  it('forces Stripe Checkout in production even when demo fields are submitted', async () => {
+    const booking = await insertBookingDirect({
+      renterId: new ObjectId(renter.user.id ?? renter.user._id),
+      bookingStatus: 'pending',
+      paymentStatus: 'unpaid',
+    });
+    const originals = {
+      nodeEnv: process.env.NODE_ENV,
+      demo: process.env.ENABLE_DEMO_PAYMENTS,
+      key: process.env.STRIPE_SECRET_KEY,
+      clientUrl: process.env.CLIENT_URL,
+    };
+    process.env.NODE_ENV = 'production';
+    process.env.ENABLE_DEMO_PAYMENTS = 'true';
+    process.env.STRIPE_SECRET_KEY = 'sk_test_1234567890abcdefghijkl';
+    process.env.CLIENT_URL = 'https://rentora.example';
+    let stripeCalled = false;
+    const response = {
+      statusCode: 200,
+      body: null,
+      status(statusCode) { this.statusCode = statusCode; return this; },
+      json(body) { this.body = body; return this; },
+    };
+    try {
+      await createCheckout({
+        body: { bookingId: booking._id.toString(), paymentMethod: 'demo_card', outcome: 'success' },
+        user: { userId: renter.user.id ?? renter.user._id },
+      }, response, {
+        checkout: { sessions: { async create() {
+          stripeCalled = true;
+          return { id: `cs_test_prod_${booking._id}`, url: 'https://checkout.stripe.test/session' };
+        } } },
+      });
+      assert.equal(response.statusCode, 201);
+      assert.equal(stripeCalled, true);
+      const { db } = await getTestDb();
+      assert.equal((await db.collection('bookings').findOne({ _id: booking._id })).paymentStatus, 'unpaid');
+    } finally {
+      if (originals.nodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = originals.nodeEnv;
+      if (originals.demo === undefined) delete process.env.ENABLE_DEMO_PAYMENTS;
+      else process.env.ENABLE_DEMO_PAYMENTS = originals.demo;
+      if (originals.key === undefined) delete process.env.STRIPE_SECRET_KEY;
+      else process.env.STRIPE_SECRET_KEY = originals.key;
+      if (originals.clientUrl === undefined) delete process.env.CLIENT_URL;
+      else process.env.CLIENT_URL = originals.clientUrl;
+    }
+  });
+
+  it('verifies Stripe signatures and processes payment and failure events', async () => {
     const { db } = await getTestDb();
     const payments = db.collection('payments');
     const bookings = db.collection('bookings');
@@ -399,6 +549,124 @@ describe('Demo Payments API', () => {
       (await bookings.findOne({ _id: failedBooking._id })).paymentStatus,
       'unpaid',
     );
+
+    async function deliverEvent(event) {
+      const payload = JSON.stringify(event);
+      const signature = Stripe.webhooks.generateTestHeaderString({ payload, secret: webhookSecret });
+      return api('/api/payments/webhook', {
+        method: 'POST',
+        headers: { 'stripe-signature': signature },
+        body: event,
+      });
+    }
+
+    const expiredBooking = await insertBookingDirect({ renterId, bookingStatus: 'pending' });
+    const expiredSessionId = `cs_test_expired_${expiredBooking._id}`;
+    await payments.insertOne({
+      transactionId: `expired_${expiredBooking._id}`,
+      bookingId: expiredBooking._id,
+      renterId,
+      stripeCheckoutSessionId: expiredSessionId,
+      amount: 300,
+      currency: 'bdt',
+      checkoutReservation: true,
+      status: 'pending',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    assert.equal((await deliverEvent({
+      id: `evt_expired_${expiredBooking._id}`,
+      object: 'event',
+      type: 'checkout.session.expired',
+      data: { object: { id: expiredSessionId } },
+    })).status, 200);
+    assert.equal((await payments.findOne({ stripeCheckoutSessionId: expiredSessionId })).status, 'cancelled');
+    assert.equal((await bookings.findOne({ _id: expiredBooking._id })).paymentStatus, 'unpaid');
+
+    const intentFailureBooking = await insertBookingDirect({ renterId, bookingStatus: 'pending' });
+    const intentFailureTransactionId = `intent_failed_${intentFailureBooking._id}`;
+    const intentFailureId = `pi_test_failed_${intentFailureBooking._id}`;
+    await payments.insertOne({
+      transactionId: intentFailureTransactionId,
+      bookingId: intentFailureBooking._id,
+      renterId,
+      amount: 300,
+      currency: 'bdt',
+      status: 'pending',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    assert.equal((await deliverEvent({
+      id: `evt_pi_failed_${intentFailureBooking._id}`,
+      object: 'event',
+      type: 'payment_intent.payment_failed',
+      data: { object: { id: intentFailureId, metadata: { transactionId: intentFailureTransactionId } } },
+    })).status, 200);
+    assert.equal((await payments.findOne({ transactionId: intentFailureTransactionId })).status, 'failed');
+    assert.equal((await bookings.findOne({ _id: intentFailureBooking._id })).paymentStatus, 'unpaid');
+
+    const refundedBooking = await insertBookingDirect({
+      renterId,
+      bookingStatus: 'confirmed',
+      paymentStatus: 'paid',
+      paymentTransactionId: `refund_${Date.now()}`,
+    });
+    const refundTransactionId = refundedBooking.paymentTransactionId;
+    const refundPaymentIntentId = `pi_test_refund_${refundedBooking._id}`;
+    await payments.insertOne({
+      transactionId: refundTransactionId,
+      bookingId: refundedBooking._id,
+      renterId,
+      stripePaymentIntentId: refundPaymentIntentId,
+      amount: 300,
+      currency: 'bdt',
+      status: 'success',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    const refundEvent = {
+      id: `evt_refunded_${refundedBooking._id}`,
+      object: 'event',
+      type: 'charge.refunded',
+      data: { object: {
+        payment_intent: refundPaymentIntentId,
+        amount: 30000,
+        amount_refunded: 30000,
+        refunds: { data: [{ id: `re_test_${refundedBooking._id}` }] },
+      } },
+    };
+    assert.equal((await deliverEvent(refundEvent)).status, 200);
+    assert.equal((await payments.findOne({ transactionId: refundTransactionId })).status, 'refunded');
+    assert.equal((await bookings.findOne({ _id: refundedBooking._id })).paymentStatus, 'refunded');
+    assert.equal((await deliverEvent(refundEvent)).status, 200);
+    assert.equal(await payments.countDocuments({ bookingId: refundedBooking._id, status: 'refunded' }), 1);
+
+    const partiallyRefundedBooking = await insertBookingDirect({
+      renterId,
+      bookingStatus: 'confirmed',
+      paymentStatus: 'paid',
+      paymentTransactionId: `partial_refund_${Date.now()}`,
+    });
+    const partialIntentId = `pi_test_partial_refund_${partiallyRefundedBooking._id}`;
+    await payments.insertOne({
+      transactionId: partiallyRefundedBooking.paymentTransactionId,
+      bookingId: partiallyRefundedBooking._id,
+      renterId,
+      stripePaymentIntentId: partialIntentId,
+      amount: 300,
+      currency: 'bdt',
+      status: 'success',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    assert.equal((await deliverEvent({
+      id: `evt_partial_refund_${partiallyRefundedBooking._id}`,
+      object: 'event',
+      type: 'charge.refunded',
+      data: { object: { payment_intent: partialIntentId, amount: 30000, amount_refunded: 5000 } },
+    })).status, 200);
+    assert.equal((await payments.findOne({ stripePaymentIntentId: partialIntentId })).status, 'success');
+    assert.equal((await bookings.findOne({ _id: partiallyRefundedBooking._id })).paymentStatus, 'paid');
 
     const liveModeBooking = await insertBookingDirect({
       renterId,

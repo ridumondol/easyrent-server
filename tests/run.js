@@ -10,6 +10,7 @@ const port = Number(process.env.TEST_PORT ?? 5055);
 const baseUrl = `http://127.0.0.1:${port}`;
 
 const testFiles = [
+  path.join(root, 'tests', 'stripeService.test.js'),
   path.join(root, 'tests', 'utils.test.js'),
   path.join(root, 'tests', 'cors.test.js'),
   path.join(root, 'tests', 'passwordSecurity.test.js'),
@@ -118,6 +119,8 @@ async function main() {
     MONGODB_DB_NAME: testDbName,
     TEST_DB_NAME: testDbName,
     TEST_BASE_URL: baseUrl,
+    ENABLE_DEMO_PAYMENTS: 'true',
+    STRIPE_WEBHOOK_SECRET: 'whsec_booking_suite_test_secret',
     JWT_SECRET: process.env.JWT_SECRET ?? 'integration-test-secret',
     CLIENT_URL: '',
     SMTP_HOST: '',

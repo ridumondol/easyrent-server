@@ -100,7 +100,7 @@ describe('Pending booking lifecycle', () => {
     assert.equal(result.refundedCount, 1);
     assert.deepEqual(refundCall, {
       paymentIntentId: 'pi_test_auto_refund',
-      idempotencyKey: `rentora-booking-refund-${booking._id}`,
+      idempotencyKey: `rentora-payment-refund-${booking.paymentTransactionId}`,
     });
     assert.equal(storedBooking.bookingStatus, 'cancelled');
     assert.equal(storedBooking.paymentStatus, 'refunded');
