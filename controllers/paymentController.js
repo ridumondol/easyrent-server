@@ -42,6 +42,15 @@ function calculateBookingAmount(booking) {
   return Number.isSafeInteger(amountInCents) && amountInCents > 0 ? amount : null;
 }
 
+function calculateBookingUnitAmount(booking) {
+  if (!isPositiveNumber(booking.pricePerDay) || !isPositiveInteger(booking.totalDays)) return null;
+  const amount = booking.rentalType
+    ? calculateRentalAmount(booking.pricePerDay, 1, booking.totalDays, booking.rentalType)
+    : calculateTotalAmount(booking.pricePerDay, 1, booking.totalDays);
+  const amountInCents = Math.round(amount * 100);
+  return Number.isSafeInteger(amountInCents) && amountInCents > 0 ? amount : null;
+}
+
 function getPendingHoldCutoff(now) {
   return new Date(now.getTime() - PENDING_HOLD_MINUTES * 60 * 1000);
 }
@@ -346,7 +355,8 @@ export async function createStripeCheckout(request, response, stripeClientOverri
       return sendError(response, { statusCode: 400, message: 'The pending booking hold has expired.' });
     }
     const amount = calculateBookingAmount(booking);
-    if (amount === null) {
+    const unitAmount = calculateBookingUnitAmount(booking);
+    if (amount === null || unitAmount === null || Math.round(unitAmount * booking.quantity * 100) !== Math.round(amount * 100)) {
       return sendError(response, { statusCode: 400, message: 'Booking pricing is invalid and cannot be paid.' });
     }
 
@@ -453,17 +463,17 @@ export async function createStripeCheckout(request, response, stripeClientOverri
       });
     }
 
-    const successUrl = new URL('/payment/success?session_id={CHECKOUT_SESSION_ID}', process.env.CLIENT_URL).toString();
-    const cancelUrl = new URL('/customer/bookings?payment=cancelled', process.env.CLIENT_URL).toString();
+    const successUrl = new URL(`/payment/success?booking_id=${bookingObjectId}&session_id={CHECKOUT_SESSION_ID}`, process.env.CLIENT_URL).toString();
+    const cancelUrl = new URL(`/payment/cancelled?booking_id=${bookingObjectId}`, process.env.CLIENT_URL).toString();
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
       line_items: [{
         price_data: {
           currency: reservation.currency,
-          unit_amount: Math.round(reservation.amount * 100),
+          unit_amount: Math.round(unitAmount * 100),
           product_data: { name: reservation.productName || equipment.title },
         },
-        quantity: 1,
+        quantity: booking.quantity,
       }],
       metadata: {
         bookingId: bookingObjectId.toString(),
@@ -501,7 +511,7 @@ export async function createStripeCheckout(request, response, stripeClientOverri
       data: { checkoutUrl: session.url, sessionId: session.id },
     });
   } catch (error) {
-    console.error('Stripe checkout creation failed.');
+    console.error('Stripe checkout creation failed:', error?.message ?? error);
     return sendError(response, { statusCode: 502, message: 'Unable to create a Stripe Checkout session.' });
   }
 }
@@ -728,12 +738,12 @@ export async function handleStripeWebhook(
 
     return sendSuccess(response, { message: 'Stripe event received.', data: { received: true } });
   } catch (error) {
-    console.error('Stripe webhook processing failed.');
+    console.error('Stripe webhook processing failed:', error?.message ?? error);
     return sendError(response, { statusCode: 500, message: 'Stripe webhook could not be processed.' });
   }
 }
 
-export async function verifyPayment(request, response) {
+export async function verifyPayment(request, response, stripeClientOverride) {
   const { bookingId } = request.params;
   if (!isValidObjectId(bookingId)) {
     return sendError(response, { statusCode: 400, message: 'Invalid booking ID.' });
@@ -746,6 +756,25 @@ export async function verifyPayment(request, response) {
       return sendError(response, { statusCode: 403, message: 'You are not authorized to view this payment.' });
     }
 
+    const payment = await getDB().collection('payments').findOne({
+      bookingId: booking._id,
+      renterId: request.user.userId,
+    });
+    let stripeSession = null;
+    if (payment?.stripeCheckoutSessionId) {
+      const requestedSessionId = request.query.session_id;
+      if (requestedSessionId && requestedSessionId !== payment.stripeCheckoutSessionId) {
+        return sendError(response, { statusCode: 404, message: 'Checkout session was not found for this booking.' });
+      }
+      if (!isStripeSecretKeyConfigured()) {
+        return sendError(response, { statusCode: 503, message: 'Stripe payment verification is unavailable.' });
+      }
+      stripeSession = await (stripeClientOverride ?? getStripeClient()).checkout.sessions.retrieve(payment.stripeCheckoutSessionId);
+      if (stripeSession.livemode === true) {
+        return sendError(response, { statusCode: 502, message: 'A live-mode Stripe session is not accepted.' });
+      }
+    }
+
     return sendSuccess(response, {
       message: 'Payment status retrieved successfully.',
       data: {
@@ -753,6 +782,8 @@ export async function verifyPayment(request, response) {
         bookingStatus: booking.bookingStatus,
         paymentStatus: booking.paymentStatus,
         paymentTransactionId: booking.paymentTransactionId ?? null,
+        stripeSessionStatus: stripeSession?.status ?? null,
+        stripePaymentStatus: stripeSession?.payment_status ?? null,
       },
     });
   } catch (error) {
@@ -781,10 +812,15 @@ export async function getMyPayments(request, response) {
   }
 }
 
-export async function createCheckout(request, response) {
+export async function createCheckout(request, response, stripeClientOverride) {
   const { paymentMethod, outcome } = request.body ?? {};
   if (paymentMethod !== undefined || outcome !== undefined) {
-    return createDemoCheckout(request, response);
+    if (process.env.NODE_ENV !== 'production' && process.env.ENABLE_DEMO_PAYMENTS === 'true') {
+      return createDemoCheckout(request, response);
+    }
+    if (process.env.NODE_ENV !== 'production') {
+      return sendError(response, { statusCode: 403, message: 'Demo payments are disabled. Use Stripe Checkout.' });
+    }
   }
-  return createStripeCheckout(request, response);
+  return createStripeCheckout(request, response, stripeClientOverride);
 }
