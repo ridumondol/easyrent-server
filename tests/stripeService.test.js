@@ -21,14 +21,14 @@ describe('Stripe environment configuration validation', () => {
     }
   });
 
-  it('accepts a Stripe test secret and rejects other key types and placeholders', () => {
+  it('accepts Stripe test and live secrets and rejects other key types and placeholders', () => {
     assert.equal(isStripeSecretKeyConfigured('sk_test_1234567890abcdef'), true);
+    assert.equal(isStripeSecretKeyConfigured('sk_live_1234567890abcdef'), true);
     for (const key of [
       '',
       'pk_test_1234567890abcdef',
       'rk_test_1234567890abcdef',
       'rkcs_test_1234567890abcdef',
-      'sk_live_1234567890abcdef',
       'sk_test_short',
       'sk_test_your_test_secret_key',
       'sk_test_replace_this_value',

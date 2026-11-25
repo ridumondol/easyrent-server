@@ -10,6 +10,7 @@ import {
   constructStripeWebhookEvent,
   getStripeClient,
   getStripeCurrency,
+  getStripeSecretKeyMode,
   isStripeSecretKeyConfigured,
   isStripeWebhookSecretConfigured,
   refundStripePaymentIntent,
@@ -175,6 +176,161 @@ async function claimStripePayment(bookings, initialBooking, payment, now) {
     if (!booking) return null;
   }
   return null;
+}
+
+function getStripeSessionValidationError(session, payment) {
+  if (session.id !== payment.stripeCheckoutSessionId) return 'Stripe Checkout session does not match the stored payment.';
+  if (session.mode !== 'payment') return 'Stripe Checkout session is not a one-time payment.';
+  if (session.status !== 'complete' || session.payment_status !== 'paid') {
+    return 'Stripe has not confirmed a completed payment.';
+  }
+  if (typeof session.livemode !== 'boolean') return 'Stripe Checkout session mode could not be verified.';
+  const configuredMode = getStripeSecretKeyMode();
+  if ((configuredMode && (session.livemode ? 'live' : 'test') !== configuredMode)
+    || (process.env.NODE_ENV === 'production' && !configuredMode)) {
+    return 'Stripe Checkout session mode does not match the server configuration.';
+  }
+  if (
+    session.metadata?.bookingId !== payment.bookingId.toString()
+    || session.metadata?.renterId !== payment.renterId.toString()
+    || session.metadata?.transactionId !== payment.transactionId
+    || !Number.isSafeInteger(session.amount_total)
+    || session.amount_total !== Math.round(payment.amount * 100)
+    || session.currency?.toLowerCase() !== payment.currency
+  ) {
+    return 'Stripe Checkout session does not match the stored payment.';
+  }
+  return null;
+}
+
+async function settleSuccessfulStripePayment(
+  session,
+  refundStripePayment = refundStripePaymentIntent,
+) {
+  const payments = getDB().collection('payments');
+  const payment = await payments.findOne({ stripeCheckoutSessionId: session.id });
+  if (!payment) return { error: 'Payment record for this Checkout session was not found.', statusCode: 404 };
+
+  const validationError = getStripeSessionValidationError(session, payment);
+  if (validationError) return { error: validationError, statusCode: 400 };
+  if (payment.status === 'refunded') return { paymentStatus: 'refunded' };
+
+  const bookings = getBookingsCollection();
+  const booking = await bookings.findOne({
+    _id: payment.bookingId,
+    renterId: payment.renterId,
+  });
+  const paymentIntentId = getPaymentIntentId(session.payment_intent);
+  const now = new Date();
+
+  if (!booking) {
+    await refundCapturedStripePayment({
+      payment,
+      payments,
+      paymentIntentId,
+      reason: 'booking_not_found',
+      now,
+      refundStripePayment,
+    });
+    return { paymentStatus: 'refunded' };
+  }
+
+  const calculatedAmount = calculateBookingAmount(booking);
+  if (
+    calculatedAmount === null
+    || Math.round(calculatedAmount * 100) !== Math.round(payment.amount * 100)
+  ) {
+    await refundCapturedStripePayment({
+      payment,
+      booking,
+      payments,
+      paymentIntentId,
+      reason: 'booking_amount_mismatch',
+      now,
+      refundStripePayment,
+    });
+    return { paymentStatus: 'refunded' };
+  }
+
+  if (
+    payment.status === 'success'
+    && booking.paymentStatus === 'paid'
+    && booking.paymentTransactionId === payment.transactionId
+    && booking.refundStatus !== 'pending'
+    && booking.refundStatus !== 'failed'
+  ) {
+    return { paymentStatus: booking.paymentStatus };
+  }
+
+  if (
+    booking.paymentStatus === 'paid'
+    && booking.paymentTransactionId === payment.transactionId
+    && (booking.refundStatus === 'pending' || booking.refundStatus === 'failed')
+  ) {
+    await refundCapturedStripePayment({
+      payment,
+      booking,
+      payments,
+      paymentIntentId,
+      reason: booking.cancellationReason || 'payment_refund_pending',
+      now,
+      refundStripePayment,
+    });
+    return { paymentStatus: 'refunded' };
+  }
+
+  const paidBooking = await claimStripePayment(bookings, booking, payment, now);
+  if (!paidBooking) {
+    await refundCapturedStripePayment({
+      payment,
+      booking,
+      payments,
+      paymentIntentId,
+      reason: 'booking_no_longer_eligible',
+      now,
+      refundStripePayment,
+    });
+    return { paymentStatus: 'refunded' };
+  }
+
+  const equipment = await getDB().collection('equipment').findOne({
+    _id: paidBooking.equipmentId,
+  });
+  const availability = equipment
+    ? await getDateAvailability({
+        equipment,
+        startDate: paidBooking.startDate,
+        endDate: paidBooking.endDate,
+        excludeBookingId: paidBooking._id,
+      })
+    : null;
+
+  await payments.updateOne(
+    { _id: payment._id, status: { $in: ['pending', 'failed', 'cancelled', 'success'] } },
+    {
+      $set: {
+        status: 'success',
+        stripePaymentIntentId: paymentIntentId,
+        updatedAt: now,
+      },
+    },
+  );
+
+  if (!availability || paidBooking.quantity > availability.availableQuantity) {
+    await refundCapturedStripePayment({
+      payment: { ...payment, status: 'success', stripePaymentIntentId: paymentIntentId },
+      booking: paidBooking,
+      payments,
+      paymentIntentId,
+      reason: 'late_payment_inventory_unavailable',
+      now,
+      refundStripePayment,
+    });
+    return { paymentStatus: 'refunded' };
+  }
+
+  const settledBooking = await bookings.findOne({ _id: paidBooking._id });
+  return { paymentStatus: settledBooking?.paymentStatus ?? 'unpaid' };
 }
 
 async function ensureSuccessfulPaymentIndex(transactions) {
@@ -537,9 +693,13 @@ export async function handleStripeWebhook(
     return sendError(response, { statusCode: 400, message: 'Invalid Stripe webhook signature.' });
   }
 
-  if (event.livemode === true) {
-    console.warn('Rejected a live-mode Stripe webhook event while test mode is enforced.');
-    return sendError(response, { statusCode: 400, message: 'Live-mode Stripe events are not accepted.' });
+  const configuredMode = getStripeSecretKeyMode();
+  if (
+    (configuredMode && (event.livemode ? 'live' : 'test') !== configuredMode)
+    || (process.env.NODE_ENV === 'production' && !configuredMode)
+  ) {
+    console.warn('Rejected a Stripe webhook event that does not match the configured Stripe mode.');
+    return sendError(response, { statusCode: 400, message: 'Stripe event mode does not match the server configuration.' });
   }
 
   try {
@@ -551,132 +711,11 @@ export async function handleStripeWebhook(
           data: { received: true },
         });
       }
-      if (!session.metadata?.bookingId) {
-        return sendError(response, { statusCode: 400, message: 'Completed Checkout session has invalid payment metadata.' });
-      }
-
-      const payments = getDB().collection('payments');
-      const payment = await payments.findOne({ stripeCheckoutSessionId: session.id });
-      if (!payment) {
-        return sendError(response, { statusCode: 404, message: 'Payment record for this Checkout session was not found.' });
-      }
-      if (
-        session.metadata.bookingId !== payment.bookingId.toString()
-        || session.metadata.renterId !== payment.renterId.toString()
-        || session.amount_total !== Math.round(payment.amount * 100)
-        || session.currency?.toLowerCase() !== payment.currency
-      ) {
-        return sendError(response, { statusCode: 400, message: 'Stripe Checkout session does not match the stored payment.' });
-      }
-      if (payment.status === 'refunded') {
-        return sendSuccess(response, { message: 'Stripe payment was already refunded.', data: { received: true } });
-      }
-
-      const bookings = getBookingsCollection();
-      const booking = await bookings.findOne({
-        _id: payment.bookingId,
-        renterId: payment.renterId,
-      });
-      const paymentIntentId = getPaymentIntentId(session.payment_intent);
-      if (
-        payment.status === 'success'
-        && booking?.paymentStatus === 'paid'
-        && booking.paymentTransactionId === payment.transactionId
-        && booking.refundStatus !== 'pending'
-        && booking.refundStatus !== 'failed'
-      ) {
-        return sendSuccess(response, { message: 'Stripe event was already processed.', data: { received: true } });
-      }
-
-      const now = new Date();
-      if (!booking) {
-        await refundCapturedStripePayment({
-          payment,
-          payments,
-          paymentIntentId,
-          reason: 'booking_not_found',
-          now,
-          refundStripePayment,
-        });
-        return sendSuccess(response, {
-          message: 'Stripe payment was refunded because its booking was unavailable.',
-          data: { received: true },
-        });
-      }
-
-      if (
-        booking.paymentStatus === 'paid'
-        && booking.paymentTransactionId === payment.transactionId
-        && (booking.refundStatus === 'pending' || booking.refundStatus === 'failed')
-      ) {
-        await refundCapturedStripePayment({
-          payment,
-          booking,
-          payments,
-          paymentIntentId,
-          reason: booking.cancellationReason || 'payment_refund_pending',
-          now,
-          refundStripePayment,
-        });
-        return sendSuccess(response, {
-          message: 'Stripe payment refund was completed.',
-          data: { received: true },
-        });
-      }
-
-      const paidBooking = await claimStripePayment(bookings, booking, payment, now);
-      if (!paidBooking) {
-        await refundCapturedStripePayment({
-          payment,
-          booking,
-          payments,
-          paymentIntentId,
-          reason: 'booking_no_longer_eligible',
-          now,
-          refundStripePayment,
-        });
-        return sendSuccess(response, {
-          message: 'Stripe payment was refunded because the booking was no longer eligible.',
-          data: { received: true },
-        });
-      }
-
-      const equipment = await getDB().collection('equipment').findOne({
-        _id: paidBooking.equipmentId,
-      });
-      const availability = equipment
-        ? await getDateAvailability({
-            equipment,
-            startDate: paidBooking.startDate,
-            endDate: paidBooking.endDate,
-            excludeBookingId: paidBooking._id,
-          })
-        : null;
-
-      await payments.updateOne(
-        { _id: payment._id, status: { $in: ['pending', 'failed', 'cancelled', 'success'] } },
-        {
-          $set: {
-            status: 'success',
-            stripePaymentIntentId: paymentIntentId,
-            updatedAt: now,
-          },
-        },
-      );
-
-      if (!availability || paidBooking.quantity > availability.availableQuantity) {
-        await refundCapturedStripePayment({
-          payment: { ...payment, status: 'success', stripePaymentIntentId: paymentIntentId },
-          booking: paidBooking,
-          payments,
-          paymentIntentId,
-          reason: 'late_payment_inventory_unavailable',
-          now,
-          refundStripePayment,
-        });
-        return sendSuccess(response, {
-          message: 'Stripe payment was refunded because the equipment was no longer available.',
-          data: { received: true },
+      const settlement = await settleSuccessfulStripePayment(session, refundStripePayment);
+      if (settlement.error) {
+        return sendError(response, {
+          statusCode: settlement.statusCode,
+          message: settlement.error,
         });
       }
     } else if (
@@ -756,39 +795,66 @@ export async function verifyPayment(request, response, dependencies = {}) {
       return sendError(response, { statusCode: 403, message: 'You are not authorized to view this payment.' });
     }
 
-    const payment = await getDB().collection('payments').findOne({
+    const requestedSessionId = request.query.session_id;
+    const paymentFilter = {
       bookingId: booking._id,
       renterId: request.user.userId,
+    };
+    if (typeof requestedSessionId === 'string' && requestedSessionId) {
+      paymentFilter.stripeCheckoutSessionId = requestedSessionId;
+    }
+    const payment = await getDB().collection('payments').findOne(paymentFilter, {
+      sort: { createdAt: -1 },
     });
+    if (typeof requestedSessionId === 'string' && requestedSessionId && !payment) {
+      return sendError(response, { statusCode: 404, message: 'Checkout session was not found for this booking.' });
+    }
     let stripeSession = null;
     if (payment?.stripeCheckoutSessionId) {
-      const requestedSessionId = request.query.session_id;
-      if (requestedSessionId && requestedSessionId !== payment.stripeCheckoutSessionId) {
+      if (
+        typeof requestedSessionId === 'string'
+        && requestedSessionId !== payment.stripeCheckoutSessionId
+      ) {
         return sendError(response, { statusCode: 404, message: 'Checkout session was not found for this booking.' });
       }
       if (!isStripeSecretKeyConfigured()) {
         return sendError(response, { statusCode: 503, message: 'Stripe payment verification is unavailable.' });
       }
       stripeSession = await (dependencies?.stripeClient ?? getStripeClient()).checkout.sessions.retrieve(payment.stripeCheckoutSessionId);
-      if (stripeSession.livemode === true) {
-        return sendError(response, { statusCode: 502, message: 'A live-mode Stripe session is not accepted.' });
+      if (stripeSession.id !== payment.stripeCheckoutSessionId) {
+        return sendError(response, { statusCode: 502, message: 'Stripe returned a different Checkout session.' });
+      }
+      if (stripeSession.status === 'expired') {
+        await getDB().collection('payments').updateOne(
+          { _id: payment._id, status: 'pending' },
+          { $set: { status: 'cancelled', updatedAt: new Date() } },
+        );
+      } else if (stripeSession.status === 'complete' && stripeSession.payment_status === 'paid') {
+        const settlement = await settleSuccessfulStripePayment(stripeSession);
+        if (settlement.error) {
+          return sendError(response, {
+            statusCode: settlement.statusCode,
+            message: settlement.error,
+          });
+        }
       }
     }
 
+    const latestBooking = await getBookingsCollection().findOne({ _id: booking._id });
     return sendSuccess(response, {
       message: 'Payment status retrieved successfully.',
       data: {
         bookingId: booking._id,
-        bookingStatus: booking.bookingStatus,
-        paymentStatus: booking.paymentStatus,
-        paymentTransactionId: booking.paymentTransactionId ?? null,
+        bookingStatus: latestBooking?.bookingStatus ?? booking.bookingStatus,
+        paymentStatus: latestBooking?.paymentStatus ?? booking.paymentStatus,
+        paymentTransactionId: latestBooking?.paymentTransactionId ?? null,
         stripeSessionStatus: stripeSession?.status ?? null,
         stripePaymentStatus: stripeSession?.payment_status ?? null,
       },
     });
   } catch (error) {
-    console.error('verifyPayment error:', error);
-    return sendError(response, { statusCode: 500, message: 'Failed to retrieve payment status.' });
+    console.error('verifyPayment error:', error?.message ?? error);
+    return sendError(response, { statusCode: 502, message: 'Unable to verify payment with Stripe.' });
   }
 }
 

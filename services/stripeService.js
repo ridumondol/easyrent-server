@@ -4,8 +4,13 @@ let stripeClient;
 
 export function isStripeSecretKeyConfigured(secretKey = process.env.STRIPE_SECRET_KEY) {
   return typeof secretKey === 'string'
-    && /^sk_test_[A-Za-z0-9]{16,}$/.test(secretKey)
+    && /^sk_(test|live)_[A-Za-z0-9]{16,}$/.test(secretKey)
     && !/(your|replace|placeholder|example|dummy|changeme)/i.test(secretKey);
+}
+
+export function getStripeSecretKeyMode(secretKey = process.env.STRIPE_SECRET_KEY) {
+  if (!isStripeSecretKeyConfigured(secretKey)) return null;
+  return secretKey.startsWith('sk_live_') ? 'live' : 'test';
 }
 
 export function isStripeWebhookSecretConfigured(secret = process.env.STRIPE_WEBHOOK_SECRET) {
