@@ -2,8 +2,15 @@
 
 Express API for **Rentora**, an equipment-rental marketplace for customers and local equipment owners.
 
-- **Live API:** `https://easyrent-server-ifgf.onrender.com`
-- **Live client:** `https://easyrent-client.vercel.app`
+## Links
+
+- **Live site:** https://easyrent-client.vercel.app/
+- **Client repository:** https://github.com/ridumondol/easyrent-client
+- **Server repository:** https://github.com/ridumondol/easyrent-server
+- **Live API:** https://easyrent-server-ifgf.onrender.com
+
+## Overview
+
 - **Local API:** `http://localhost:5000`
 - **Database:** MongoDB via Mongoose models/indexes and MongoDB collection operations.
 
