@@ -408,6 +408,101 @@ describe('Demo Payments API', () => {
     }
   });
 
+  it('lets confirmed unpaid bookings pay and reconciles a completed Stripe session on retry', async () => {
+    const renterId = new ObjectId(renter.user.id ?? renter.user._id);
+    const ownerId = new ObjectId(owner.user.id ?? owner.user._id);
+    const equipmentId = await insertEquipmentDirect({ ownerId, quantity: 2 });
+    const booking = await insertBookingDirect({
+      equipmentId,
+      renterId,
+      ownerId,
+      bookingStatus: 'confirmed',
+      paymentStatus: 'unpaid',
+      createdAt: new Date(Date.now() - 60 * 60 * 1000),
+    });
+    const originalKey = process.env.STRIPE_SECRET_KEY;
+    const originalClientUrl = process.env.CLIENT_URL;
+    process.env.STRIPE_SECRET_KEY = 'sk_test_1234567890abcdefghijkl';
+    process.env.CLIENT_URL = 'https://rentora.example';
+
+    let sessionPaid = false;
+    let createCount = 0;
+    let transactionId;
+    const sessionId = `cs_test_confirmed_${booking._id}`;
+    const stripeClient = {
+      checkout: {
+        sessions: {
+          async create() {
+            createCount += 1;
+            return {
+              id: sessionId,
+              url: 'https://checkout.stripe.test/session',
+              status: 'open',
+              expires_at: Math.floor(Date.now() / 1000) + 3600,
+            };
+          },
+          async retrieve(id) {
+            return {
+              id,
+              mode: 'payment',
+              status: sessionPaid ? 'complete' : 'open',
+              payment_status: sessionPaid ? 'paid' : 'unpaid',
+              livemode: false,
+              amount_total: 30000,
+              currency: 'bdt',
+              metadata: {
+                bookingId: booking._id.toString(),
+                renterId: renterId.toString(),
+                transactionId,
+              },
+              payment_intent: `pi_test_confirmed_${booking._id}`,
+              url: 'https://checkout.stripe.test/session',
+            };
+          },
+        },
+      },
+    };
+    const makeResponse = () => ({
+      statusCode: 200,
+      body: null,
+      status(statusCode) { this.statusCode = statusCode; return this; },
+      json(body) { this.body = body; return this; },
+    });
+
+    try {
+      const request = {
+        body: { bookingId: booking._id.toString() },
+        user: { userId: renterId },
+      };
+      const checkoutResponse = makeResponse();
+      await createStripeCheckout(request, checkoutResponse, { stripeClient });
+      assert.equal(checkoutResponse.statusCode, 201);
+      assert.equal(checkoutResponse.body.data.checkoutUrl, 'https://checkout.stripe.test/session');
+
+      const { db } = await getTestDb();
+      transactionId = (await db.collection('payments').findOne({ bookingId: booking._id })).transactionId;
+      sessionPaid = true;
+      const retryResponse = makeResponse();
+      await createStripeCheckout(request, retryResponse, { stripeClient });
+      assert.equal(retryResponse.statusCode, 200);
+      assert.equal(retryResponse.body.data.paymentStatus, 'paid');
+      assert.equal(createCount, 1);
+
+      const storedBooking = await db.collection('bookings').findOne({ _id: booking._id });
+      assert.equal(storedBooking.bookingStatus, 'confirmed');
+      assert.equal(storedBooking.paymentStatus, 'paid');
+      assert.equal(
+        (await db.collection('payments').findOne({ bookingId: booking._id })).status,
+        'success',
+      );
+    } finally {
+      if (originalKey === undefined) delete process.env.STRIPE_SECRET_KEY;
+      else process.env.STRIPE_SECRET_KEY = originalKey;
+      if (originalClientUrl === undefined) delete process.env.CLIENT_URL;
+      else process.env.CLIENT_URL = originalClientUrl;
+    }
+  });
+
   it('settles a Stripe payment during verification and safely supports repeats', async () => {
     const { db } = await getTestDb();
     const renterId = new ObjectId(renter.user.id ?? renter.user._id);
@@ -1052,6 +1147,34 @@ renterId: new ObjectId(renter.user.id ?? renter.user._id),
     assert.ok(history.payments.some(
       (payment) => payment.transactionId === checkout.transaction.transactionId,
     ));
+  });
+
+  it('allows confirmed bookings to complete a demo payment after the pending hold expires', async () => {
+    const booking = await insertBookingDirect({
+      renterId: new ObjectId(renter.user.id ?? renter.user._id),
+      bookingStatus: 'confirmed',
+      paymentStatus: 'unpaid',
+      createdAt: new Date(Date.now() - 60 * 60 * 1000),
+    });
+
+    const checkout = assertSuccess(
+      await api('/api/payments/checkout', {
+        method: 'POST',
+        token: renter.token,
+        body: {
+          bookingId: booking._id.toString(),
+          paymentMethod: 'demo_card',
+          outcome: 'success',
+        },
+      }),
+      201,
+    );
+
+    const { db } = await getTestDb();
+    const storedBooking = await db.collection('bookings').findOne({ _id: booking._id });
+    assert.equal(checkout.transaction.status, 'success');
+    assert.equal(storedBooking.bookingStatus, 'confirmed');
+    assert.equal(storedBooking.paymentStatus, 'paid');
   });
 
   it('records failed and cancelled attempts without marking bookings paid', async () => {

@@ -56,6 +56,16 @@ function getPendingHoldCutoff(now) {
   return new Date(now.getTime() - PENDING_HOLD_MINUTES * 60 * 1000);
 }
 
+function isEligibleForCheckout(booking) {
+  return booking.paymentStatus === 'unpaid'
+    && (booking.bookingStatus === 'pending' || booking.bookingStatus === 'confirmed');
+}
+
+function hasExpiredPendingHold(booking, now) {
+  return booking.bookingStatus === 'pending'
+    && (!(booking.createdAt instanceof Date) || booking.createdAt < getPendingHoldCutoff(now));
+}
+
 function getPaymentIntentId(paymentIntent) {
   if (typeof paymentIntent === 'string') return paymentIntent;
   return typeof paymentIntent?.id === 'string' ? paymentIntent.id : '';
@@ -388,12 +398,12 @@ async function createDemoCheckout(request, response) {
     if (booking.paymentStatus === 'paid') {
       return sendError(response, { statusCode: 409, message: 'This booking has already been paid.' });
     }
-    if (booking.bookingStatus !== 'pending' || booking.paymentStatus !== 'unpaid') {
-      return sendError(response, { statusCode: 400, message: 'Only pending, unpaid bookings can be paid.' });
+    if (!isEligibleForCheckout(booking)) {
+      return sendError(response, { statusCode: 400, message: 'Only pending or confirmed, unpaid bookings can be paid.' });
     }
 
     const now = new Date();
-    if (!(booking.createdAt instanceof Date) || booking.createdAt < getPendingHoldCutoff(now)) {
+    if (hasExpiredPendingHold(booking, now)) {
       return sendError(response, { statusCode: 400, message: 'The pending booking hold has expired.' });
     }
     const amount = calculateBookingAmount(booking);
@@ -418,9 +428,11 @@ async function createDemoCheckout(request, response) {
         {
           _id: bookingObjectId,
           renterId: request.user.userId,
-          bookingStatus: 'pending',
+          bookingStatus: booking.bookingStatus,
           paymentStatus: 'unpaid',
-          createdAt: { $gte: getPendingHoldCutoff(now) },
+          ...(booking.bookingStatus === 'pending'
+            ? { createdAt: { $gte: getPendingHoldCutoff(now) } }
+            : {}),
         },
         {
           $set: {
@@ -502,12 +514,12 @@ export async function createStripeCheckout(request, response, dependencies = {})
     if (booking.paymentStatus === 'paid') {
       return sendError(response, { statusCode: 409, message: 'This booking has already been paid.' });
     }
-    if (booking.bookingStatus !== 'pending' || booking.paymentStatus !== 'unpaid') {
-      return sendError(response, { statusCode: 400, message: 'Only pending, unpaid bookings can be paid.' });
+    if (!isEligibleForCheckout(booking)) {
+      return sendError(response, { statusCode: 400, message: 'Only pending or confirmed, unpaid bookings can be paid.' });
     }
 
     const now = new Date();
-    if (!(booking.createdAt instanceof Date) || booking.createdAt < getPendingHoldCutoff(now)) {
+    if (hasExpiredPendingHold(booking, now)) {
       return sendError(response, { statusCode: 400, message: 'The pending booking hold has expired.' });
     }
     const amount = calculateBookingAmount(booking);
@@ -536,6 +548,27 @@ export async function createStripeCheckout(request, response, dependencies = {})
         });
       }
       if (existingSession.status === 'complete') {
+        if (existingSession.payment_status === 'paid') {
+          const settlement = await settleSuccessfulStripePayment(existingSession);
+          if (settlement.error) {
+            return sendError(response, {
+              statusCode: settlement.statusCode,
+              message: settlement.error,
+            });
+          }
+          if (settlement.paymentStatus === 'paid') {
+            return sendSuccess(response, {
+              message: 'Payment confirmed successfully.',
+              data: { bookingId: booking._id, paymentStatus: 'paid' },
+            });
+          }
+          if (settlement.paymentStatus === 'refunded') {
+            return sendError(response, {
+              statusCode: 409,
+              message: 'The payment was refunded because the booking could not be completed.',
+            });
+          }
+        }
         return sendError(response, {
           statusCode: 409,
           message: 'This payment is processing. Check your payment history before trying again.',
