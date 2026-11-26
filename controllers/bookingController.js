@@ -460,7 +460,7 @@ export async function updateBookingStatus(request, response) {
     }
 
     const targetBookingStatus = bookingStatus ?? booking.bookingStatus;
-    if (bookingStatus) {
+    if (bookingStatus && bookingStatus !== booking.bookingStatus) {
       const allowed = ALLOWED_BOOKING_TRANSITIONS[booking.bookingStatus] ?? [];
       if (!allowed.includes(bookingStatus)) {
         return sendError(response, {
