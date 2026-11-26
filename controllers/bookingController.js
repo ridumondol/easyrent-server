@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { getDB } from '../config/db.js';
 import { sendError, sendSuccess } from '../utils/response.js';
 import { BOOKING_STATUSES, ALLOWED_BOOKING_TRANSITIONS } from '../utils/constants.js';
@@ -437,7 +438,7 @@ export async function cancelBooking(request, response) {
 // ── PATCH /api/bookings/:id/status ────────────────────────────────────────
 export async function updateBookingStatus(request, response) {
   try {
-    const { bookingStatus } = request.body;
+    const { bookingStatus, paymentStatus } = request.body;
 
     const booking = await getBookingsCollection().findOne({
       _id: toObjectId(request.params.id),
@@ -458,13 +459,16 @@ export async function updateBookingStatus(request, response) {
       });
     }
 
-    const allowed = ALLOWED_BOOKING_TRANSITIONS[booking.bookingStatus] ?? [];
-    if (!allowed.includes(bookingStatus)) {
-      return sendError(response, {
-        statusCode: 400,
-        message:
-          `Cannot change booking status from ${booking.bookingStatus} to ${bookingStatus}.`,
-      });
+    const targetBookingStatus = bookingStatus ?? booking.bookingStatus;
+    if (bookingStatus) {
+      const allowed = ALLOWED_BOOKING_TRANSITIONS[booking.bookingStatus] ?? [];
+      if (!allowed.includes(bookingStatus)) {
+        return sendError(response, {
+          statusCode: 400,
+          message:
+            `Cannot change booking status from ${booking.bookingStatus} to ${bookingStatus}.`,
+        });
+      }
     }
     if (booking.refundStatus) {
       return sendError(response, {
@@ -502,6 +506,9 @@ export async function updateBookingStatus(request, response) {
       }
     }
 
+    const isMarkingPaid = paymentStatus === 'paid' && booking.paymentStatus !== 'paid';
+    const transactionId = isMarkingPaid ? randomUUID() : booking.paymentTransactionId;
+
     const result = await getBookingsCollection().findOneAndUpdate(
       {
         _id: booking._id,
@@ -510,7 +517,14 @@ export async function updateBookingStatus(request, response) {
       },
       {
         $set: {
-          bookingStatus,
+          bookingStatus: targetBookingStatus,
+          ...(isMarkingPaid
+            ? {
+                paymentStatus: 'paid',
+                paymentTransactionId: transactionId,
+                paidAt: new Date(),
+              }
+            : {}),
           updatedAt: new Date(),
         },
       },
@@ -523,6 +537,22 @@ export async function updateBookingStatus(request, response) {
       });
     }
 
+    if (isMarkingPaid) {
+      await getDB().collection('paymentTransactions').insertOne({
+        transactionId,
+        bookingId: booking._id,
+        renterId: booking.renterId,
+        amount: booking.totalAmount,
+        currency: 'bdt',
+        paymentMethod: 'cash_or_offline',
+        status: 'success',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      }).catch((txErr) => {
+        console.error('Failed to insert cash transaction:', txErr);
+      });
+    }
+
     if (result.paymentStatus === 'unpaid' && process.env.NODE_ENV !== 'test') {
       await reconcileBookingPayment(result._id).catch(() => {});
       const reconciled = await getBookingsCollection().findOne({ _id: result._id });
@@ -530,7 +560,9 @@ export async function updateBookingStatus(request, response) {
     }
 
     return sendSuccess(response, {
-      message: `Booking ${bookingStatus} successfully.`,
+      message: isMarkingPaid
+        ? 'Payment marked as paid successfully.'
+        : `Booking ${targetBookingStatus} successfully.`,
       data: { booking: result },
     });
   } catch (error) {

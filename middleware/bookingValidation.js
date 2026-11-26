@@ -157,12 +157,26 @@ export function validateBookingId(request, response, next) {
 
 /** PATCH /api/bookings/:id/status */
 export function validateBookingStatusUpdate(request, response, next) {
-  const { bookingStatus } = request.body ?? {};
+  const { bookingStatus, paymentStatus } = request.body ?? {};
 
-  if (!BOOKING_STATUSES.includes(bookingStatus)) {
+  if (bookingStatus !== undefined && !BOOKING_STATUSES.includes(bookingStatus)) {
     return sendError(response, {
       statusCode: 400,
       message: `bookingStatus must be one of: ${BOOKING_STATUSES.join(', ')}.`,
+    });
+  }
+
+  if (paymentStatus !== undefined && !['paid', 'unpaid'].includes(paymentStatus)) {
+    return sendError(response, {
+      statusCode: 400,
+      message: 'paymentStatus must be paid or unpaid.',
+    });
+  }
+
+  if (bookingStatus === undefined && paymentStatus === undefined) {
+    return sendError(response, {
+      statusCode: 400,
+      message: 'Either bookingStatus or paymentStatus must be provided.',
     });
   }
 

@@ -1,6 +1,7 @@
 import { ObjectId } from 'mongodb';
 import { getDB } from '../config/db.js';
 import { sendError, sendSuccess } from '../utils/response.js';
+import { reconcileBookingPayment } from './paymentController.js';
 
 const VALID_ROLES = ['customer', 'renter', 'owner', 'admin'];
 
@@ -17,6 +18,19 @@ export async function getOverview(_request, response) {
     const now = new Date();
     const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 11, 1));
     const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
+
+    if (process.env.NODE_ENV !== 'test') {
+      const recentUnpaid = await bookings
+        .find({ paymentStatus: 'unpaid' })
+        .sort({ createdAt: -1 })
+        .limit(10)
+        .toArray();
+      if (recentUnpaid.length > 0) {
+        await Promise.allSettled(
+          recentUnpaid.map((b) => reconcileBookingPayment(b._id))
+        );
+      }
+    }
 
     const [
       totalUsers,
