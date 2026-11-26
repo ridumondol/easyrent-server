@@ -1,5 +1,6 @@
 import { getDB } from '../config/db.js';
 import { sendError, sendSuccess } from '../utils/response.js';
+import { BOOKING_STATUS } from '../utils/constants.js';
 
 export async function getOwnerAnalytics(request, response) {
   try {
@@ -7,7 +8,7 @@ export async function getOwnerAnalytics(request, response) {
     const db = getDB();
     const [totalEquipment, completedRentals, earningsByMonth, revenueResult] = await Promise.all([
       db.collection('equipment').countDocuments({ ownerId }),
-      db.collection('bookings').countDocuments({ ownerId, bookingStatus: 'completed' }),
+      db.collection('bookings').countDocuments({ ownerId, bookingStatus: BOOKING_STATUS.COMPLETED }),
       db.collection('payments').aggregate([
         { $match: { status: 'success' } },
         {

@@ -2,6 +2,7 @@ import { ObjectId } from 'mongodb';
 import { getDB } from '../config/db.js';
 import { sendError, sendSuccess } from '../utils/response.js';
 import { reconcileBookingPayment } from './paymentController.js';
+import { BOOKING_STATUS } from '../utils/constants.js';
 
 const VALID_ROLES = ['customer', 'renter', 'owner', 'admin'];
 
@@ -46,13 +47,13 @@ export async function getOverview(_request, response) {
       equipment.countDocuments(),
       bookings.countDocuments(),
       equipment.countDocuments({ approvalStatus: 'pending' }),
-      bookings.countDocuments({ bookingStatus: 'completed' }),
+      bookings.countDocuments({ bookingStatus: BOOKING_STATUS.COMPLETED }),
       bookings.aggregate([
         { $match: { paymentStatus: 'paid' } },
         { $group: { _id: null, total: { $sum: '$totalAmount' } } },
       ]).toArray(),
       bookings.aggregate([
-        { $match: { bookingStatus: { $in: ['confirmed', 'completed'] } } },
+        { $match: { bookingStatus: { $in: [BOOKING_STATUS.CONFIRMED, BOOKING_STATUS.COMPLETED] } } },
         { $group: { _id: null, total: { $sum: '$totalAmount' } } },
       ]).toArray(),
       bookings.aggregate([

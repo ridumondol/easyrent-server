@@ -1,4 +1,5 @@
 import mongoose from 'mongoose';
+import { BOOKING_STATUS, BOOKING_STATUSES } from '../utils/constants.js';
 
 const bookingSchema = new mongoose.Schema({
   equipmentId: { type: mongoose.Schema.Types.ObjectId, ref: 'RentoraEquipment', required: true },
@@ -15,7 +16,7 @@ const bookingSchema = new mongoose.Schema({
   phone: { type: String, required: true, maxlength: 50 },
   address: { type: String, required: true, maxlength: 500 },
   notes: { type: String, default: '', maxlength: 1000 },
-  bookingStatus: { type: String, enum: ['pending', 'confirmed', 'cancelled', 'completed'], default: 'pending' },
+  bookingStatus: { type: String, enum: BOOKING_STATUSES, default: BOOKING_STATUS.PENDING },
   paymentStatus: { type: String, enum: ['unpaid', 'paid', 'refunded'], default: 'unpaid' },
   paymentTransactionId: { type: String },
   paidAt: { type: Date },

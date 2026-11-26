@@ -1,7 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { getDB } from '../config/db.js';
 import { sendError, sendSuccess } from '../utils/response.js';
-import { BOOKING_STATUSES, ALLOWED_BOOKING_TRANSITIONS } from '../utils/constants.js';
+import {
+  BOOKING_STATUSES,
+  BOOKING_STATUS,
+  BOOKING_STATUS_VALIDATION_MESSAGE,
+  ALLOWED_BOOKING_TRANSITIONS,
+} from '../utils/constants.js';
 import { calculateRentalAmount, calculateRentalUnits } from '../utils/rental.js';
 import {
   getBookingsCollection,
@@ -13,9 +18,6 @@ import { reconcileBookingPayment } from './paymentController.js';
 function getEquipmentCollection() {
   return getDB().collection('equipment');
 }
-
-const STATUS_FILTER_MESSAGE =
-  `bookingStatus must be one of: ${BOOKING_STATUSES.join(', ')}.`;
 
 function sameId(left, right) {
   if (!left || !right) return false;
@@ -39,7 +41,12 @@ function resolveStatusFilter(request, response) {
   if (value === undefined || value === '') return { ok: true, value: null };
 
   if (!BOOKING_STATUSES.includes(value)) {
-    sendError(response, { statusCode: 400, message: STATUS_FILTER_MESSAGE });
+    console.warn('Rejected booking list request with invalid bookingStatus filter.', {
+      receivedType: typeof value,
+      receivedValue: typeof value === 'string' ? value.slice(0, 80) : '[non-string]',
+      reason: 'bookingStatus is not an exact allowed status value',
+    });
+    sendError(response, { statusCode: 400, message: BOOKING_STATUS_VALIDATION_MESSAGE });
     return { ok: false };
   }
 
@@ -147,7 +154,7 @@ export async function createBooking(request, response) {
       phone,
       address,
       notes,
-      bookingStatus: 'pending',
+      bookingStatus: BOOKING_STATUS.PENDING,
       paymentStatus: 'unpaid',
       createdAt: now,
       updatedAt: now,
@@ -375,7 +382,7 @@ export async function cancelBooking(request, response) {
       });
     }
 
-    if (booking.bookingStatus === 'cancelled' || booking.bookingStatus === 'completed') {
+    if (booking.bookingStatus === BOOKING_STATUS.CANCELLED || booking.bookingStatus === BOOKING_STATUS.COMPLETED) {
       return sendError(response, {
         statusCode: 400,
         message: `A ${booking.bookingStatus} booking cannot be cancelled.`,
@@ -401,7 +408,7 @@ export async function cancelBooking(request, response) {
       },
       {
         $set: {
-          bookingStatus: 'cancelled',
+          bookingStatus: BOOKING_STATUS.CANCELLED,
           ...(isPaid
             ? {
                 cancellationReason: 'booking_cancelled',
@@ -460,9 +467,19 @@ export async function updateBookingStatus(request, response) {
     }
 
     const targetBookingStatus = bookingStatus ?? booking.bookingStatus;
-    if (targetBookingStatus !== booking.bookingStatus) {
+    // Repeated status updates are idempotent, including retries for terminal
+    // states such as a completed booking.
+    const isIdempotentStatusRetry =
+      bookingStatus === undefined || targetBookingStatus === booking.bookingStatus;
+    if (!isIdempotentStatusRetry) {
       const allowed = ALLOWED_BOOKING_TRANSITIONS[booking.bookingStatus] ?? [];
       if (!allowed.includes(bookingStatus)) {
+        console.warn('Rejected booking status transition.', {
+          bookingId: booking._id.toString(),
+          from: booking.bookingStatus,
+          to: bookingStatus,
+          reason: 'transition is not allowed',
+        });
         return sendError(response, {
           statusCode: 400,
           message:
@@ -478,7 +495,7 @@ export async function updateBookingStatus(request, response) {
     }
     // Re-validate inventory when moving a pending booking to confirmed,
     // otherwise stock could have been taken while the request was pending.
-    if (bookingStatus === 'confirmed' && booking.bookingStatus === 'pending') {
+    if (bookingStatus === BOOKING_STATUS.CONFIRMED && booking.bookingStatus === BOOKING_STATUS.PENDING) {
       const equipment = await getEquipmentCollection().findOne({
         _id: booking.equipmentId,
       });

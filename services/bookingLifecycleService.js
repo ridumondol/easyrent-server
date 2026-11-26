@@ -1,5 +1,5 @@
 import { getDB } from '../config/db.js';
-import { PENDING_HOLD_MINUTES } from '../utils/constants.js';
+import { BOOKING_STATUS, PENDING_HOLD_MINUTES } from '../utils/constants.js';
 import { refundStripePaymentIntent } from './stripeService.js';
 
 const OWNER_CONFIRMATION_TIMEOUT_MS = 24 * 60 * 60 * 1000;
@@ -67,7 +67,7 @@ async function processPendingRefunds(now, refundStripePayment) {
   const bookings = getDB().collection('bookings');
   const retryCutoff = new Date(now.getTime() - REFUND_RETRY_DELAY_MS);
   const pendingRefunds = await bookings.find({
-    bookingStatus: 'cancelled',
+    bookingStatus: BOOKING_STATUS.CANCELLED,
     paymentStatus: 'paid',
     $or: [
       { refundStatus: { $in: ['pending', 'failed'] } },
@@ -80,7 +80,7 @@ async function processPendingRefunds(now, refundStripePayment) {
     const claim = await bookings.updateOne(
       {
         _id: booking._id,
-        bookingStatus: 'cancelled',
+        bookingStatus: BOOKING_STATUS.CANCELLED,
         paymentStatus: 'paid',
         refundStatus: booking.refundStatus,
         ...(booking.refundStatus === 'processing'
@@ -101,7 +101,7 @@ async function processPendingRefunds(now, refundStripePayment) {
       await bookings.updateOne(
         {
           _id: booking._id,
-          bookingStatus: 'cancelled',
+          bookingStatus: BOOKING_STATUS.CANCELLED,
           paymentStatus: 'paid',
           refundStatus: 'processing',
         },
@@ -119,7 +119,7 @@ async function processPendingRefunds(now, refundStripePayment) {
       await bookings.updateOne(
         {
           _id: booking._id,
-          bookingStatus: 'cancelled',
+          bookingStatus: BOOKING_STATUS.CANCELLED,
           paymentStatus: 'paid',
           refundStatus: 'processing',
         },
@@ -142,13 +142,13 @@ export async function runPendingBookingLifecycle(
 
   const expiredUnpaid = await bookings.updateMany(
     {
-      bookingStatus: 'pending',
+      bookingStatus: BOOKING_STATUS.PENDING,
       paymentStatus: 'unpaid',
       createdAt: { $lte: unpaidCutoff },
     },
     {
       $set: {
-        bookingStatus: 'cancelled',
+        bookingStatus: BOOKING_STATUS.CANCELLED,
         cancellationReason: 'payment_hold_expired',
         updatedAt: now,
       },
@@ -157,14 +157,14 @@ export async function runPendingBookingLifecycle(
 
   await bookings.updateMany(
     {
-      bookingStatus: 'pending',
+      bookingStatus: BOOKING_STATUS.PENDING,
       paymentStatus: 'paid',
       paidAt: { $lte: confirmationCutoff },
       refundStatus: { $exists: false },
     },
     {
       $set: {
-        bookingStatus: 'cancelled',
+        bookingStatus: BOOKING_STATUS.CANCELLED,
         cancellationReason: 'owner_confirmation_timeout',
         refundStatus: 'pending',
         updatedAt: now,

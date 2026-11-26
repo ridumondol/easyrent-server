@@ -2,6 +2,7 @@ import { getDB } from '../config/db.js';
 import {
   INVENTORY_BLOCKING_STATUSES,
   PENDING_HOLD_MINUTES,
+  BOOKING_STATUS,
 } from './constants.js';
 import { toObjectId } from './validation.js';
 
@@ -36,10 +37,10 @@ export function buildBlockingBookingsFilter({
     startDate: { $lt: endDate },
     endDate: { $gt: startDate },
     $or: [
-      { bookingStatus: 'confirmed' },
-      { bookingStatus: 'pending', paymentStatus: 'paid' },
+      { bookingStatus: BOOKING_STATUS.CONFIRMED },
+      { bookingStatus: BOOKING_STATUS.PENDING, paymentStatus: 'paid' },
       {
-        bookingStatus: 'pending',
+        bookingStatus: BOOKING_STATUS.PENDING,
         createdAt: { $gte: holdCutoff },
         $or: [
           { paymentStatus: 'unpaid' },

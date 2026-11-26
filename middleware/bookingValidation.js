@@ -1,4 +1,7 @@
-import { BOOKING_STATUSES } from '../utils/constants.js';
+import {
+  BOOKING_STATUSES,
+  BOOKING_STATUS_VALIDATION_MESSAGE,
+} from '../utils/constants.js';
 import { parseRentalDate, calculateTotalDays, todayUtc } from '../utils/rental.js';
 import {
   isNonEmptyString,
@@ -160,9 +163,17 @@ export function validateBookingStatusUpdate(request, response, next) {
   const { bookingStatus, paymentStatus } = request.body ?? {};
 
   if (bookingStatus !== undefined && !BOOKING_STATUSES.includes(bookingStatus)) {
+    console.warn('Rejected booking status update with invalid bookingStatus.', {
+      bookingId: request.params.id,
+      receivedType: typeof bookingStatus,
+      receivedValue: typeof bookingStatus === 'string'
+        ? bookingStatus.slice(0, 80)
+        : '[non-string]',
+      reason: 'bookingStatus is not an exact allowed status value',
+    });
     return sendError(response, {
       statusCode: 400,
-      message: `bookingStatus must be one of: ${BOOKING_STATUSES.join(', ')}.`,
+      message: BOOKING_STATUS_VALIDATION_MESSAGE,
     });
   }
 

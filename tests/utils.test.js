@@ -11,6 +11,9 @@ import {
 import { isValidObjectId } from '../utils/validation.js';
 import { buildBlockingBookingsFilter } from '../utils/availability.js';
 import { getHealth } from '../controllers/healthController.js';
+import { Booking } from '../models/Booking.js';
+import { BOOKING_STATUSES } from '../utils/constants.js';
+import { validateBookingStatusUpdate } from '../middleware/bookingValidation.js';
 
 describe('Rental utility functions', () => {
   it('parses date-only strings into UTC midnight', () => {
@@ -63,6 +66,36 @@ describe('Rental utility functions', () => {
 });
 
 describe('Validation & availability helpers', () => {
+  it('uses the shared booking status source for the Mongoose enum', () => {
+    assert.deepEqual(Booking.schema.path('bookingStatus').enumValues, BOOKING_STATUSES);
+  });
+
+  it('accepts only exact booking status values in status update requests', () => {
+    for (const bookingStatus of BOOKING_STATUSES) {
+      const response = createMockResponse();
+      let continued = false;
+      validateBookingStatusUpdate(
+        { body: { bookingStatus }, params: { id: 'booking-id' } },
+        response,
+        () => { continued = true; },
+      );
+      assert.equal(continued, true, `${bookingStatus} should be accepted`);
+    }
+
+    for (const bookingStatus of ['Completed', 'complete', 'in_progress', null]) {
+      const response = createMockResponse();
+      let continued = false;
+      validateBookingStatusUpdate(
+        { body: { bookingStatus }, params: { id: 'booking-id' } },
+        response,
+        () => { continued = true; },
+      );
+      assert.equal(continued, false, `${String(bookingStatus)} should be rejected`);
+      assert.equal(response.statusCode, 400);
+      assert.match(response.body.message, /^bookingStatus must be one of:/);
+    }
+  });
+
   it('strictly validates ObjectIds', () => {
     const id = new ObjectId();
     assert.equal(isValidObjectId(id.toString()), true);
@@ -103,6 +136,21 @@ describe('Validation & availability helpers', () => {
     assert.deepEqual(filter._id, { $ne: excludeBookingId });
   });
 });
+
+function createMockResponse() {
+  return {
+    statusCode: null,
+    body: null,
+    status(statusCode) {
+      this.statusCode = statusCode;
+      return this;
+    },
+    json(body) {
+      this.body = body;
+      return this;
+    },
+  };
+}
 
 describe('Health endpoint', () => {
   it('returns 503 when the database is disconnected', () => {

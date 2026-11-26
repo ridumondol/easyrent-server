@@ -921,17 +921,27 @@ describe('Booking & Rental Management System', () => {
       );
     });
 
-    it('rejects an invalid booking status value (400)', async () => {
+    it('rejects mistyped and differently cased booking status values (400)', async () => {
       const seeded = await insertBookingDirect({
         ownerId: new ObjectId(ownerA.user._id),
         bookingStatus: 'pending',
       });
+      for (const bookingStatus of ['unknown', 'Completed', 'complete', 'in_progress']) {
+        assertError(
+          await api(`/api/bookings/${seeded._id}/status`, {
+            method: 'PATCH',
+            token: ownerA.token,
+            body: { bookingStatus },
+          }),
+          400,
+          'bookingStatus must be one of',
+        );
+      }
+    });
+
+    it('rejects invalid booking status filters on booking list requests (400)', async () => {
       assertError(
-        await api(`/api/bookings/${seeded._id}/status`, {
-          method: 'PATCH',
-          token: ownerA.token,
-          body: { bookingStatus: 'unknown' },
-        }),
+        await api('/api/bookings/my?bookingStatus=all', { token: renterA.token }),
         400,
         'bookingStatus must be one of',
       );
@@ -1004,6 +1014,30 @@ describe('Booking & Rental Management System', () => {
 
       assert.equal(data.booking.bookingStatus, 'completed');
       assert.equal(data.booking.paymentStatus, 'paid');
+    });
+
+    it('accepts an idempotent completed status when payment is already recorded', async () => {
+      const seeded = await insertBookingDirect({
+        renterId: new ObjectId(renterA.user._id),
+        ownerId: new ObjectId(ownerA.user._id),
+        bookingStatus: 'completed',
+        paymentStatus: 'paid',
+        paymentTransactionId: 'existing-paid-transaction',
+        paidAt: new Date(),
+      });
+
+      const data = assertSuccess(
+        await api(`/api/bookings/${seeded._id}/status`, {
+          method: 'PATCH',
+          token: ownerA.token,
+          body: { bookingStatus: 'completed', paymentStatus: 'paid' },
+        }),
+        200,
+      );
+
+      assert.equal(data.booking.bookingStatus, 'completed');
+      assert.equal(data.booking.paymentStatus, 'paid');
+      assert.equal(data.booking.paymentTransactionId, 'existing-paid-transaction');
     });
 
     it('treats completed bookings as terminal (400)', async () => {

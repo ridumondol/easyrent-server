@@ -1,6 +1,7 @@
 import { ObjectId } from 'mongodb';
 import { getDB } from '../config/db.js';
 import { sendError, sendSuccess } from '../utils/response.js';
+import { BOOKING_STATUS } from '../utils/constants.js';
 import { isValidObjectId } from '../utils/validation.js';
 
 export async function getReviews(request, response) {
@@ -51,7 +52,7 @@ export async function createReview(request, response) {
       _id: new ObjectId(bookingId),
       equipmentId: new ObjectId(equipmentId),
       renterId: request.user.userId,
-      bookingStatus: 'completed',
+      bookingStatus: BOOKING_STATUS.COMPLETED,
       paymentStatus: 'paid',
     });
     if (!booking) {

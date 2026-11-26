@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { getDB } from '../config/db.js';
 import { sendError, sendSuccess } from '../utils/response.js';
 import { calculateRentalAmount, calculateTotalAmount } from '../utils/rental.js';
-import { PENDING_HOLD_MINUTES } from '../utils/constants.js';
+import { BOOKING_STATUS, PENDING_HOLD_MINUTES } from '../utils/constants.js';
 import { getDateAvailability } from '../utils/availability.js';
 import { isPositiveInteger, isPositiveNumber, isValidObjectId, toObjectId } from '../utils/validation.js';
 import { refundPaymentRecord } from '../services/bookingLifecycleService.js';
@@ -58,11 +58,15 @@ function getPendingHoldCutoff(now) {
 
 function isEligibleForCheckout(booking) {
   return booking.paymentStatus === 'unpaid'
-    && (booking.bookingStatus === 'pending' || booking.bookingStatus === 'confirmed' || booking.bookingStatus === 'completed');
+    && (
+      booking.bookingStatus === BOOKING_STATUS.PENDING
+      || booking.bookingStatus === BOOKING_STATUS.CONFIRMED
+      || booking.bookingStatus === BOOKING_STATUS.COMPLETED
+    );
 }
 
 function hasExpiredPendingHold(booking, now) {
-  return booking.bookingStatus === 'pending'
+  return booking.bookingStatus === BOOKING_STATUS.PENDING
     && (!(booking.createdAt instanceof Date) || booking.createdAt < getPendingHoldCutoff(now));
 }
 
@@ -103,10 +107,10 @@ async function refundCapturedStripePayment({
 
   if (booking && !bookingAlreadyPaidForAnotherPayment) {
     await bookings.updateOne(
-      { _id: booking._id, bookingStatus: { $ne: 'completed' } },
+      { _id: booking._id, bookingStatus: { $ne: BOOKING_STATUS.COMPLETED } },
       {
         $set: {
-          bookingStatus: 'cancelled',
+          bookingStatus: BOOKING_STATUS.CANCELLED,
           paymentStatus: 'paid',
           paymentTransactionId: payment.transactionId,
           paidAt: booking.paidAt ?? now,
@@ -150,14 +154,14 @@ async function claimStripePayment(bookings, initialBooking, payment, now) {
     }
 
     const wasExpiredHold =
-      booking.bookingStatus === 'cancelled'
+      booking.bookingStatus === BOOKING_STATUS.CANCELLED
       && booking.paymentStatus === 'unpaid'
       && booking.cancellationReason === 'payment_hold_expired';
     const canAcceptPayment =
-      (booking.bookingStatus === 'pending' && booking.paymentStatus === 'unpaid')
+      (booking.bookingStatus === BOOKING_STATUS.PENDING && booking.paymentStatus === 'unpaid')
       || wasExpiredHold
-      || (booking.bookingStatus === 'confirmed' && booking.paymentStatus === 'unpaid')
-      || (booking.bookingStatus === 'completed' && booking.paymentStatus === 'unpaid');
+      || (booking.bookingStatus === BOOKING_STATUS.CONFIRMED && booking.paymentStatus === 'unpaid')
+      || (booking.bookingStatus === BOOKING_STATUS.COMPLETED && booking.paymentStatus === 'unpaid');
     if (!canAcceptPayment) return null;
 
     const update = await bookings.updateOne(
@@ -170,7 +174,7 @@ async function claimStripePayment(bookings, initialBooking, payment, now) {
       },
       {
         $set: {
-          ...(wasExpiredHold ? { bookingStatus: 'pending' } : {}),
+          ...(wasExpiredHold ? { bookingStatus: BOOKING_STATUS.PENDING } : {}),
           paymentStatus: 'paid',
           paymentTransactionId: payment.transactionId,
           paidAt: now,
@@ -327,7 +331,7 @@ async function settleSuccessfulStripePayment(
     },
   );
 
-  const needsAvailabilityCheck = paidBooking.bookingStatus !== 'completed';
+  const needsAvailabilityCheck = paidBooking.bookingStatus !== BOOKING_STATUS.COMPLETED;
   if (needsAvailabilityCheck && (!availability || paidBooking.quantity > availability.availableQuantity)) {
     await refundCapturedStripePayment({
       payment: { ...payment, status: 'success', stripePaymentIntentId: paymentIntentId },
@@ -432,7 +436,7 @@ async function createDemoCheckout(request, response) {
           renterId: request.user.userId,
           bookingStatus: booking.bookingStatus,
           paymentStatus: 'unpaid',
-          ...(booking.bookingStatus === 'pending'
+          ...(booking.bookingStatus === BOOKING_STATUS.PENDING
             ? { createdAt: { $gte: getPendingHoldCutoff(now) } }
             : {}),
         },
