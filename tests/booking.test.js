@@ -968,6 +968,44 @@ describe('Booking & Rental Management System', () => {
       assert.equal(data.booking.bookingStatus, 'completed');
     });
 
+    it('allows an owner to mark a completed booking as paid without changing its status', async () => {
+      const seeded = await insertBookingDirect({
+        renterId: new ObjectId(renterA.user._id),
+        ownerId: new ObjectId(ownerA.user._id),
+        bookingStatus: 'completed',
+      });
+
+      const data = assertSuccess(
+        await api(`/api/bookings/${seeded._id}/status`, {
+          method: 'PATCH',
+          token: ownerA.token,
+          body: { paymentStatus: 'paid' },
+        }),
+      );
+
+      assert.equal(data.booking.bookingStatus, 'completed');
+      assert.equal(data.booking.paymentStatus, 'paid');
+    });
+
+    it('ignores a repeated completed status when marking payment as paid', async () => {
+      const seeded = await insertBookingDirect({
+        renterId: new ObjectId(renterA.user._id),
+        ownerId: new ObjectId(ownerA.user._id),
+        bookingStatus: 'completed',
+      });
+
+      const data = assertSuccess(
+        await api(`/api/bookings/${seeded._id}/status`, {
+          method: 'PATCH',
+          token: ownerA.token,
+          body: { bookingStatus: 'completed', paymentStatus: 'paid' },
+        }),
+      );
+
+      assert.equal(data.booking.bookingStatus, 'completed');
+      assert.equal(data.booking.paymentStatus, 'paid');
+    });
+
     it('treats completed bookings as terminal (400)', async () => {
       const seeded = await insertBookingDirect({
         renterId: new ObjectId(renterA.user._id),
