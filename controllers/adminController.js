@@ -25,6 +25,7 @@ export async function getOverview(_request, response) {
       pendingEquipmentApprovals,
       completedRentals,
       revenueResult,
+      confirmedBookingResult,
       bookingMonths,
     ] = await Promise.all([
       users.countDocuments(),
@@ -34,6 +35,10 @@ export async function getOverview(_request, response) {
       bookings.countDocuments({ bookingStatus: 'completed' }),
       bookings.aggregate([
         { $match: { paymentStatus: 'paid' } },
+        { $group: { _id: null, total: { $sum: '$totalAmount' } } },
+      ]).toArray(),
+      bookings.aggregate([
+        { $match: { bookingStatus: { $in: ['confirmed', 'completed'] } } },
         { $group: { _id: null, total: { $sum: '$totalAmount' } } },
       ]).toArray(),
       bookings.aggregate([
@@ -70,6 +75,7 @@ export async function getOverview(_request, response) {
           pendingEquipmentApprovals,
           completedRentals,
           totalRevenue: revenueResult[0]?.total ?? 0,
+          confirmedBookingValue: confirmedBookingResult[0]?.total ?? 0,
           monthlyBookings,
         },
       },
