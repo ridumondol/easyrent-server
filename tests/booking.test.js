@@ -855,7 +855,7 @@ describe('Booking & Rental Management System', () => {
       assert.equal(data.booking.paymentStatus, 'paid');
     });
 
-    it('rejects confirmation of an unpaid pending booking', async () => {
+    it('allows an owner to confirm an unpaid pending booking', async () => {
       const equipmentId = await createEquipment(ownerA.token);
       const booking = assertSuccess(
         await api('/api/bookings', {
@@ -866,15 +866,16 @@ describe('Booking & Rental Management System', () => {
         201,
       ).booking;
 
-      assertError(
+      const data = assertSuccess(
         await api(`/api/bookings/${booking._id}/status`, {
           method: 'PATCH',
           token: ownerA.token,
           body: { bookingStatus: 'confirmed' },
         }),
-        400,
-        'Only paid bookings',
+        200,
       );
+      assert.equal(data.booking.bookingStatus, 'confirmed');
+      assert.equal(data.booking.paymentStatus, 'unpaid');
     });
 
     it('allows an owner to reject a pending booking', async () => {
