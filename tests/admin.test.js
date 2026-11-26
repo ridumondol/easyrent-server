@@ -62,6 +62,9 @@ describe('Admin API', () => {
     const equipmentObjectId = new ObjectId(equipmentId);
     const renterId = new ObjectId(renter.user._id);
     const ownerId = new ObjectId(owner.user._id);
+    const beforeOverview = assertSuccess(
+      await api('/api/admin/overview', { token: admin.token }),
+    ).overview;
     await db.collection('bookings').insertOne({
       equipmentId: equipmentObjectId,
       renterId,
@@ -76,6 +79,20 @@ describe('Admin API', () => {
       createdAt: new Date(),
       updatedAt: new Date(),
     });
+    await db.collection('bookings').insertOne({
+      equipmentId: equipmentObjectId,
+      renterId,
+      ownerId,
+      startDate: new Date('2031-02-05T00:00:00.000Z'),
+      endDate: new Date('2031-02-08T00:00:00.000Z'),
+      totalDays: 3,
+      quantity: 1,
+      totalAmount: 120,
+      bookingStatus: 'confirmed',
+      paymentStatus: 'unpaid',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
 
     const overview = assertSuccess(await api('/api/admin/overview', { token: admin.token })).overview;
     assert.ok(overview.totalUsers >= 3);
@@ -83,7 +100,8 @@ describe('Admin API', () => {
     assert.ok(overview.totalBookings >= 1);
     assert.ok(overview.pendingEquipmentApprovals >= 1);
     assert.ok(overview.completedRentals >= 1);
-    assert.ok(overview.totalRevenue >= 360);
+    assert.equal(overview.totalRevenue - beforeOverview.totalRevenue, 360);
+    assert.equal(overview.confirmedBookingValue - beforeOverview.confirmedBookingValue, 480);
     assert.equal(overview.monthlyBookings.length, 12);
 
     const equipment = assertSuccess(await api('/api/admin/equipment', { token: admin.token }));
