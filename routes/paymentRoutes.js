@@ -10,7 +10,7 @@ import { roleMiddleware } from '../middleware/roleMiddleware.js';
 const router = Router();
 
 router.post('/checkout', authMiddleware, roleMiddleware('renter'), createCheckout);
-router.get('/verify/:bookingId', authMiddleware, roleMiddleware('renter'), verifyPayment);
+router.get('/verify/:bookingId', authMiddleware, roleMiddleware('renter', 'owner', 'admin'), verifyPayment);
 router.get('/my', authMiddleware, roleMiddleware('renter'), getMyPayments);
 
 export default router;

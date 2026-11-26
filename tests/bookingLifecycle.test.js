@@ -13,6 +13,8 @@ import { getDateAvailability } from '../utils/availability.js';
 describe('Pending booking lifecycle', () => {
   before(async () => {
     await connectToDatabase();
+    const { db } = await getTestDb();
+    await db.collection('bookings').deleteMany({ bookingStatus: 'pending' });
   });
 
   after(async () => {

@@ -79,7 +79,7 @@ function startServer(env) {
 
 function runTests(env) {
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, ['--test', ...testFiles], {
+    const child = spawn(process.execPath, ['--test', '--test-concurrency=1', ...testFiles], {
       cwd: root,
       env,
       stdio: 'inherit',

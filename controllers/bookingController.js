@@ -7,6 +7,7 @@ import {
   getDateAvailability,
 } from '../utils/availability.js';
 import { isPositiveNumber, toObjectId } from '../utils/validation.js';
+import { reconcileBookingPayment } from './paymentController.js';
 
 function getEquipmentCollection() {
   return getDB().collection('equipment');
@@ -288,6 +289,23 @@ export async function getOwnerBookings(request, response) {
       .sort({ createdAt: -1 })
       .toArray();
 
+    if (process.env.NODE_ENV !== 'test') {
+      const unpaidBookings = bookings.filter((b) => b.paymentStatus === 'unpaid');
+      if (unpaidBookings.length > 0) {
+        await Promise.allSettled(
+          unpaidBookings.slice(0, 5).map((b) => reconcileBookingPayment(b._id))
+        );
+        const refreshedBookings = await getBookingsCollection()
+          .find(filter)
+          .sort({ createdAt: -1 })
+          .toArray();
+        return sendSuccess(response, {
+          message: 'Owner bookings retrieved successfully.',
+          data: { bookings: refreshedBookings, count: refreshedBookings.length },
+        });
+      }
+    }
+
     return sendSuccess(response, {
       message: 'Owner bookings retrieved successfully.',
       data: { bookings, count: bookings.length },
@@ -503,6 +521,12 @@ export async function updateBookingStatus(request, response) {
         statusCode: 409,
         message: 'Booking status changed while this update was being processed. Please refresh and try again.',
       });
+    }
+
+    if (result.paymentStatus === 'unpaid' && process.env.NODE_ENV !== 'test') {
+      await reconcileBookingPayment(result._id).catch(() => {});
+      const reconciled = await getBookingsCollection().findOne({ _id: result._id });
+      if (reconciled) result.paymentStatus = reconciled.paymentStatus;
     }
 
     return sendSuccess(response, {

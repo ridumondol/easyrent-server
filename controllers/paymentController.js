@@ -58,7 +58,7 @@ function getPendingHoldCutoff(now) {
 
 function isEligibleForCheckout(booking) {
   return booking.paymentStatus === 'unpaid'
-    && (booking.bookingStatus === 'pending' || booking.bookingStatus === 'confirmed');
+    && (booking.bookingStatus === 'pending' || booking.bookingStatus === 'confirmed' || booking.bookingStatus === 'completed');
 }
 
 function hasExpiredPendingHold(booking, now) {
@@ -156,7 +156,8 @@ async function claimStripePayment(bookings, initialBooking, payment, now) {
     const canAcceptPayment =
       (booking.bookingStatus === 'pending' && booking.paymentStatus === 'unpaid')
       || wasExpiredHold
-      || (booking.bookingStatus === 'confirmed' && booking.paymentStatus === 'unpaid');
+      || (booking.bookingStatus === 'confirmed' && booking.paymentStatus === 'unpaid')
+      || (booking.bookingStatus === 'completed' && booking.paymentStatus === 'unpaid');
     if (!canAcceptPayment) return null;
 
     const update = await bookings.updateOne(
@@ -326,7 +327,8 @@ async function settleSuccessfulStripePayment(
     },
   );
 
-  if (!availability || paidBooking.quantity > availability.availableQuantity) {
+  const needsAvailabilityCheck = paidBooking.bookingStatus !== 'completed';
+  if (needsAvailabilityCheck && (!availability || paidBooking.quantity > availability.availableQuantity)) {
     await refundCapturedStripePayment({
       payment: { ...payment, status: 'success', stripePaymentIntentId: paymentIntentId },
       booking: paidBooking,
@@ -824,14 +826,17 @@ export async function verifyPayment(request, response, dependencies = {}) {
   try {
     const booking = await getBookingsCollection().findOne({ _id: toObjectId(bookingId) });
     if (!booking) return sendError(response, { statusCode: 404, message: 'Booking not found.' });
-    if (String(booking.renterId) !== String(request.user.userId)) {
+    const isRenter = String(booking.renterId) === String(request.user.userId);
+    const isOwner = String(booking.ownerId) === String(request.user.userId);
+    const isAdmin = request.user.role === 'admin';
+    if (!isRenter && !isOwner && !isAdmin) {
       return sendError(response, { statusCode: 403, message: 'You are not authorized to view this payment.' });
     }
 
     const requestedSessionId = request.query.session_id;
     const paymentFilter = {
       bookingId: booking._id,
-      renterId: request.user.userId,
+      ...(isRenter ? { renterId: request.user.userId } : {}),
     };
     if (typeof requestedSessionId === 'string' && requestedSessionId) {
       paymentFilter.stripeCheckoutSessionId = requestedSessionId;
@@ -922,4 +927,25 @@ export async function createCheckout(request, response, dependencies = {}) {
     }
   }
   return createStripeCheckout(request, response, dependencies);
+}
+
+export async function reconcileBookingPayment(bookingId) {
+  try {
+    const payments = getDB().collection('payments');
+    const payment = await payments.findOne({
+      bookingId: toObjectId(bookingId),
+      status: 'pending',
+    });
+    if (!payment?.stripeCheckoutSessionId) return null;
+    if (!isStripeSecretKeyConfigured()) return null;
+    const stripe = getStripeClient();
+    if (!stripe) return null;
+    const session = await stripe.checkout.sessions.retrieve(payment.stripeCheckoutSessionId);
+    if (session.status === 'complete' && session.payment_status === 'paid') {
+      return await settleSuccessfulStripePayment(session);
+    }
+  } catch (err) {
+    console.error('reconcileBookingPayment error:', err?.message ?? err);
+  }
+  return null;
 }
