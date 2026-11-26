@@ -454,13 +454,6 @@ export async function updateBookingStatus(request, response) {
         message: 'A refund is being processed for this booking.',
       });
     }
-    if (bookingStatus === 'confirmed' && booking.paymentStatus !== 'paid') {
-      return sendError(response, {
-        statusCode: 400,
-        message: 'Only paid bookings can be confirmed.',
-      });
-    }
-
     // Re-validate inventory when moving a pending booking to confirmed,
     // otherwise stock could have been taken while the request was pending.
     if (bookingStatus === 'confirmed' && booking.bookingStatus === 'pending') {
